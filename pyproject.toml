@@ -1,0 +1,24 @@
+[project]
+name = "drip-daily-just-pulled"
+version = "0.1.0"
+description = "Unattended daily Instagram post of the biggest Drip-fulfilled instant pack hit"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.45.0",
+    "python-dotenv>=1.0.1",
+    "pytz>=2024.2",
+    "requests>=2.32.0",
+    "filelock>=3.13",
+    "Pillow>=10.4",
+    # Required for zoneinfo.ZoneInfo on Windows (no system IANA tz database).
+    # Linux runners ship tzdata in /usr/share/zoneinfo; pip install is harmless.
+    "tzdata>=2024.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+]
+
+[tool.uv]
+package = false

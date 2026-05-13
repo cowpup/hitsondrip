@@ -1,0 +1,67 @@
+# Daily "Just Pulled" Drip Shop Live → Instagram post.
+#
+# Fires at 12pm PT every day. Cron timezone is UTC; "0 19 * * *" lands at:
+#   - 12pm PDT  (UTC-7, in effect roughly mid-March → early-November)
+#   - 11am PST  (UTC-8, in effect roughly early-November → mid-March)
+# This 1-hour drift during winter is intentional: keeping the cron in
+# UTC means the GitHub Actions schedule never silently shifts when DST
+# transitions happen.  If we want a stable 12pm-PT-year-round trigger
+# we'd need two cron entries gated by the date, which isn't worth it.
+#
+# The post itself is always scheduled for 6pm PT same day via Metricool
+# (see src/schedule_time.py), so the IG publish time is DST-stable
+# regardless of when the cron fires.
+
+name: daily
+
+on:
+  schedule:
+    # 12pm PDT / 11am PST  → 19:00 UTC year-round
+    - cron: "0 19 * * *"
+  # Manual trigger for testing or ad-hoc reruns.
+  workflow_dispatch:
+
+# image_host.py needs to write to the `daily-output` orphan branch.
+permissions:
+  contents: write
+
+# Don't pile up concurrent runs; if a manual run starts while the
+# scheduled one is still going, cancel the older one.
+concurrency:
+  group: daily
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (main branch)
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Sync dependencies
+        run: uv sync --frozen --no-install-project || uv sync
+
+      - name: Run main.py
+        env:
+          ANTHROPIC_API_KEY:      ${{ secrets.ANTHROPIC_API_KEY }}
+          METRICOOL_USER_TOKEN:   ${{ secrets.METRICOOL_USER_TOKEN }}
+          METRICOOL_USER_ID:      ${{ secrets.METRICOOL_USER_ID }}
+          METRICOOL_BLOG_ID:      ${{ secrets.METRICOOL_BLOG_ID }}
+          SLACK_BOT_TOKEN:        ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID:       ${{ secrets.SLACK_CHANNEL_ID }}
+          # image_host.py reads these. The repo-scoped GITHUB_TOKEN is
+          # auto-injected by Actions and has `contents: write` per the
+          # workflow `permissions:` block above. GITHUB_REPO is the
+          # owner/repo string image_host.py uses in API calls.
+          GITHUB_TOKEN:           ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO:            ${{ github.repository }}
+        run: uv run python -u main.py

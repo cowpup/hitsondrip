@@ -1,0 +1,33 @@
+# Secrets — never commit. .env.example is the documented template.
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# uv / virtualenv
+.venv/
+uv.lock
+
+# Local test artifacts — these are produced by ad-hoc renderer runs
+# (uv run python -m src.renderer ...) and tools/render_recent_hits.py.
+# Kept out of git; the daily cron writes its output to the `daily-output`
+# branch via image_host.py instead.
+test_output*.png
+test_variety_*.png
+data/
+
+# IDE / OS / dev-tool local config
+.vscode/
+.idea/
+.claude/
+*.swp
+.DS_Store
