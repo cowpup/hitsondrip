@@ -469,15 +469,26 @@ def run() -> int:
 def _extract_post_id(response: Optional[dict[str, Any]]) -> Optional[str]:
     """Pull the Metricool-assigned post ID out of a schedule response.
 
-    Metricool's response shape includes the ID under one of several keys
-    depending on the endpoint version. Probe in order; first hit wins.
+    Confirmed shape from POST /v2/scheduler/posts (probed 2026-05-14):
+        {"data": {"id": 325889577, "uuid": "...", "publicationDate": {...}, ...}}
+    The post object is wrapped under "data". GET responses for the same
+    endpoint return the post unwrapped — we probe top-level too in case
+    Metricool changes the wrapping later.
     """
     if not response:
         return None
+    # Top-level first (in case the wrapping ever goes away).
     for key in ("id", "postId", "uuid"):
         v = response.get(key)
-        if v not in (None, ""):
+        if v not in (None, "", 0):
             return str(v)
+    # Wrapped under "data" (current POST response shape).
+    data = response.get("data")
+    if isinstance(data, dict):
+        for key in ("id", "postId", "uuid"):
+            v = data.get(key)
+            if v not in (None, "", 0):
+                return str(v)
     return None
 
 
