@@ -19,3 +19,11 @@ compatibility_date = "2024-11-01"
 
 # Free-tier defaults: 100k requests/day, 10ms CPU per request.
 # Our worker fires ~once-per-button-click, ~5/month expected.
+
+# KV namespace for click deduplication. Each approval/skip click writes
+# the Slack message_ts into this namespace with a 24h TTL. Subsequent
+# clicks on the same message see the existing entry and no-op, so a
+# user double-clicking can't create duplicate Metricool posts.
+[[kv_namespaces]]
+binding = "DEDUP"
+id = "e564cd1c16c34426878d72f48dc86510"

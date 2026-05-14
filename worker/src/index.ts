@@ -34,6 +34,13 @@ export interface Env {
   METRICOOL_USER_TOKEN: string;
   METRICOOL_USER_ID: string;
   METRICOOL_BLOG_ID: string;
+  /**
+   * KV namespace for click deduplication. Worker stores the Slack
+   * message_ts as a key with 24h TTL on first click; subsequent clicks
+   * on the same message see the entry and no-op. Prevents double-click
+   * (or rage-click) from creating duplicate Metricool posts.
+   */
+  DEDUP: KVNamespace;
 }
 
 const METRICOOL_BASE = "https://app.metricool.com/api";
@@ -94,11 +101,34 @@ export default {
     const action = interaction.actions[0];
     const value = action.value || "";
     const username = interaction.user?.username || interaction.user?.name || "someone";
+    const messageTs = interaction.message?.ts;
+
+    // Click deduplication via KV. First click for a given message_ts
+    // sets the key; subsequent clicks see it set and bail out. The
+    // check-then-set isn't atomic across Cloudflare's edge — for a
+    // single-user-clicking-twice case in the same colo, KV reads after
+    // writes are typically consistent within milliseconds, so this
+    // catches the realistic race. (For stronger guarantees we'd need
+    // Durable Objects.)
+    if (messageTs) {
+      const dedupKey = `processed:${messageTs}`;
+      const existing = await env.DEDUP.get(dedupKey);
+      if (existing) {
+        // Already actioned. No-op — also no Slack reply since the
+        // message has already been updated by the first click handler.
+        return new Response("", { status: 200 });
+      }
+      // Lock immediately. 24h TTL — well past the 5:55pm PT window the
+      // Slack message is relevant for. await ensures the put completes
+      // before we kick off any side-effecting work below.
+      await env.DEDUP.put(dedupKey, "1", { expirationTtl: 60 * 60 * 24 });
+    }
 
     // Slack requires a 200 within 3s. Heavy work goes into waitUntil so
     // we respond fast and the Metricool POSTs run in the background.
     if (value === "reject") {
-      ctx.waitUntil(replyInThread(
+      // Replace original message — buttons disappear, status visible to channel.
+      ctx.waitUntil(replaceOriginal(
         interaction,
         `:no_entry_sign: *Skipped by @${username}* — nothing posted to Metricool.`,
       ));
@@ -112,6 +142,7 @@ export default {
         post = decodePayload(encoded);
       } catch (e) {
         const err = e as Error;
+        // Leave buttons in place on decode failure so the user can hit Skip.
         ctx.waitUntil(replyInThread(
           interaction,
           `:warning: Couldn't decode the post payload: \`${err.message}\``,
@@ -140,6 +171,14 @@ async function handleApprove(
   post: PostPayload,
   env: Env,
 ): Promise<void> {
+  // First thing: replace the original message to remove the buttons.
+  // This kills the UX-level re-click window within a few hundred ms,
+  // belt-and-suspenders with the KV dedup in the main handler.
+  await replaceOriginal(
+    interaction,
+    `:hourglass_flowing_sand: *Processing approval by @${username}...*`,
+  );
+
   const tz = post.timezone || DEFAULT_TIMEZONE;
   const results: string[] = [];
 
@@ -163,8 +202,9 @@ async function handleApprove(
     }
   }
 
+  // Final update — replaces "Processing..." with the outcome.
   const summary = results.join(" · ");
-  await replyInThread(
+  await replaceOriginal(
     interaction,
     `:white_check_mark: *Approved by @${username}* — ${summary}`,
   );
@@ -281,9 +321,58 @@ function decodeBase64Utf8(b64: string): string {
 }
 
 // --------------------------------------------------------------------- //
-// Slack reply via response_url.
+// Slack message updates via response_url.
 // --------------------------------------------------------------------- //
 
+/**
+ * Replace the original Slack message (the one with the buttons) with a
+ * new version: same image preview, but the action buttons block is
+ * removed and a status section is appended. Visible to everyone who
+ * could see the original (the channel members). Used for both approve
+ * and reject so the buttons are gone after one click and the outcome
+ * is durably visible.
+ */
+async function replaceOriginal(
+  payload: SlackInteractionPayload,
+  statusText: string,
+): Promise<void> {
+  if (!payload.response_url) return;
+
+  // Keep all original blocks EXCEPT the action buttons; append a new
+  // section block with the status. This preserves the image preview
+  // and the original details lines.
+  const originalBlocks = Array.isArray(payload.message?.blocks)
+    ? (payload.message?.blocks as Array<{ type?: string }>)
+    : [];
+  const blocksKept = originalBlocks.filter((b) => b?.type !== "actions");
+  const newBlocks = [
+    ...blocksKept,
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: statusText },
+    },
+  ];
+
+  try {
+    await fetch(payload.response_url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        replace_original: true,
+        text: statusText,
+        blocks: newBlocks,
+      }),
+    });
+  } catch {
+    /* swallow — we already returned 200 to Slack's main handler */
+  }
+}
+
+/**
+ * Post an ephemeral-style reply in-thread without modifying the
+ * original message. Used for non-action error states (e.g. malformed
+ * payload) so the buttons remain clickable for retry.
+ */
 async function replyInThread(
   payload: SlackInteractionPayload,
   text: string,
@@ -300,7 +389,7 @@ async function replyInThread(
       }),
     });
   } catch {
-    /* swallow — we already returned 200 to Slack's main handler */
+    /* swallow */
   }
 }
 
