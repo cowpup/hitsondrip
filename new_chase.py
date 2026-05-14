@@ -84,8 +84,16 @@ MCP_BETA = "mcp-client-2025-11-20"
 DRIPSHOPLIVE_MCP_URL = "https://db-mcp-production.up.railway.app/sse"
 DRIPSHOPLIVE_MCP_NAME = "dripshoplive"
 
-# Image hosted as a sibling of latest.png on the daily-output orphan branch.
-CHASE_IMAGE_FILENAME = "latest_chase.png"
+# Image hosted on the daily-output orphan branch. Filename includes the
+# run epoch so each upload is a NEW path — defeats Slack's image-proxy
+# cache, which caches by path and ignores the `?v=<timestamp>` query
+# string we used to use with the static `latest_chase.png` URL. Without
+# this, Slack shows a previous run's render in the embed even when the
+# message text is correctly chain-resolved (observed 2026-05-14:
+# message body said "High Roller Pack" but image preview was the prior
+# test's Collector's Jam).
+def _chase_image_filename() -> str:
+    return f"chase_{int(time.time())}.png"
 
 # Freshness guardrail. Default 36 hours; env override for ad-hoc tuning
 # during quiet stretches. Just-Pulled doesn't need this because its
@@ -715,17 +723,17 @@ def run() -> int:
         return 1
 
     # --- Upload -------------------------------------------------------------
+    # Unique filename per run (see _chase_image_filename). No cache-bust
+    # query string needed because the path itself is already unique.
     try:
-        raw_image_url = publish_to_github(png_bytes, filename=CHASE_IMAGE_FILENAME)
+        chase_filename = _chase_image_filename()
+        raw_image_url = publish_to_github(png_bytes, filename=chase_filename)
         log.info("Uploaded to %s", raw_image_url)
     except ImageHostError as e:
         _emit_failure_to_slack("Image host upload failed", e)
         return 1
 
-    # Cache-bust the image URL — same reasoning as main.py: Slack and
-    # Metricool both cache raw.githubusercontent.com responses, and we
-    # overwrite the same `latest_chase.png` URL every successful run.
-    image_url = f"{raw_image_url}?v={int(time.time())}"
+    image_url = raw_image_url
 
     # --- Compose payload + post Slack ---------------------------------------
     publish_iso, publish_tz = schedule_time.next_6pm_pt()
