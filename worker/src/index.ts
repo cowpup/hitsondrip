@@ -279,17 +279,24 @@ async function handleApprove(
 }
 
 /**
- * Build a clickable link to the Metricool dashboard page for a
- * specific scheduled post. Used to surface edit links in the Slack
- * approval reply so marketing can tweak captions/timing in-place.
+ * Build a clickable link to Metricool's planner calendar for the
+ * configured blog. The user lands on the calendar and finds the
+ * scheduled post on its publish date.
  *
- * The path format mirrors the Metricool REST API's
- * /api/v2/scheduler/posts/{id} convention; the web app uses the
- * same /scheduler/posts/{id} structure. If you click a link and get
- * a 404, drop a note and I'll swap the path — easy fix.
+ * Why not a deep-link to the specific post: Metricool's working
+ * deep-link format is
+ *   /planner/calendar?blogId={blogId}&openWithPostUuid={uuid}
+ * but the `openWithPostUuid` is a 64-bit signed-int identifier that
+ * is NOT the same as the `id` returned by the REST POST response
+ * (the REST `id` is used for DELETE only). We don't currently
+ * capture the calendar UUID from the POST response — the field
+ * name is unknown. metricoolPost() now logs the full response JSON
+ * after each successful POST so we can discover the right field
+ * name and iterate to a true deep-link in a follow-up. Earlier
+ * version sent users to /scheduler/posts/{id}?blogId=... which 404s.
  */
-function metricoolDashboardUrl(postId: string, env: Env): string {
-  const u = new URL(`https://app.metricool.com/scheduler/posts/${postId}`);
+function metricoolDashboardUrl(_postId: string, env: Env): string {
+  const u = new URL("https://app.metricool.com/planner/calendar");
   u.searchParams.set("blogId", env.METRICOOL_BLOG_ID);
   return u.toString();
 }
@@ -501,8 +508,16 @@ async function metricoolPost(body: Record<string, unknown>, env: Env): Promise<s
   }
   // Metricool wraps POST responses as `{"data": {"id": <number>, ...}}`.
   // Pull the ID so the caller can attach a delete button referencing it.
+  //
+  // TEMPORARY: log the FULL response JSON so we can discover which
+  // field carries the calendar `postUuid` (a 64-bit signed-int that is
+  // separate from the REST `id` and is needed to deep-link the Slack
+  // approve-reply into the Metricool calendar). Remove the verbose
+  // log once metricoolDashboardUrl is upgraded to use the real UUID.
   try {
-    const json = (await resp.json()) as Record<string, unknown>;
+    const text = await resp.text();
+    console.log(`[metricool POST response] ${text.slice(0, 2000)}`);
+    const json = JSON.parse(text) as Record<string, unknown>;
     const data = (json && typeof json === "object" && "data" in json
       ? json.data
       : json) as Record<string, unknown> | undefined;
