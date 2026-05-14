@@ -4,26 +4,24 @@ You have access to the DripShopLive Postgres database via the MCP tool `dripshop
 
 ## Task
 
-Run the SQL query provided to you below verbatim against DripShopLive. The query returns AT MOST 1 row — the highest-value chase card added to user 65643's chase-pool inventory in the most recent batch, filtered to `price >= <threshold>` where the threshold is `10 * pack_price` and pack_price is read from a config file (already substituted into the SQL).
+Run the SQL query provided to you below verbatim against DripShopLive. Different queries in this pipeline return different row counts (some 0–1, some 0–5). Return EVERY row the query produces, in the order the query returns them. Do not filter or truncate.
 
 ## Output format
 
-Respond with exactly one fenced ```json``` block containing a JSON ARRAY of the rows (length 0 or 1), no prose around it. Each element must match this shape:
+Respond with exactly one fenced ```json``` block containing a JSON ARRAY of the rows (any length from 0 up to whatever the SQL's LIMIT permits), no prose around it. Each element is an object with one key per SELECTed column. Example shape (column names will vary by query):
 
 ```json
 [
   {
-    "card_product_id": <int>,
+    "card_product_id": 1234567,
     "card_name": "...",
-    "cert_number": "...",
-    "card_image_url": "https://cdn.dripshop.live/product/...",
-    "hit_value": <number>,
-    "added_at": "YYYY-MM-DDTHH:MM:SS..."
+    "hit_value": 474,
+    "added_at": "2026-05-14T17:00:00..."
   }
 ]
 ```
 
-If the query returns zero rows (no chase ≥ threshold in the latest batch), respond with an empty array:
+If the query returns zero rows, respond with an empty array:
 
 ```json
 []
@@ -33,4 +31,4 @@ Do not retry the query, do not explore the schema, do not write commentary. Run 
 
 ## SQL
 
-(The harness will append the contents of `queries/new_chase.sql` here at runtime, with the `:threshold` placeholder already substituted.)
+(The harness appends one of the project's `queries/*.sql` files here at runtime, with any `:placeholder` already substituted to a literal value.)
