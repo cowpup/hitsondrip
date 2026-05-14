@@ -76,6 +76,7 @@ PROMPT_PATH = Path("prompt_chase.md")
 SQL_FRESHNESS_PATH = Path("queries") / "new_chase_freshness.sql"
 SQL_MAIN_PATH = Path("queries") / "new_chase.sql"
 SQL_NEAR_MISS_PATH = Path("queries") / "new_chase_near_miss.sql"
+SQL_PACK_IMAGE_PATH = Path("queries") / "pack_image_lookup.sql"
 CONFIG_PATH = Path("config") / "featured_pack.json"
 
 ANTHROPIC_MODEL = "claude-opus-4-7"
@@ -109,18 +110,34 @@ DEFAULT_CHASE_THRESHOLD_MULTIPLIER = 10
 def load_featured_pack() -> dict[str, Any]:
     """Load and validate config/featured_pack.json.
 
-    Returns a dict with keys: pack_name (str), pack_price (number),
-    pack_image_url (str), chase_threshold_multiplier (number, default
-    DEFAULT_CHASE_THRESHOLD_MULTIPLIER if absent). Raises RuntimeError
-    if the file is missing or any required key is absent / wrong type.
+    Required keys: pack_name (str), pack_price (positive number).
+    Optional keys:
+        pack_box_break_id (UUID string) — if set, new_chase.py queries
+            box_breaks.reveal_animation_data->>'packImage' at runtime
+            to get the canonical "custom pack image" set in Drip's
+            admin panel. Validated as a UUID at load time to make any
+            mistake fail fast (and to make later string substitution
+            into SQL injection-safe).
+        pack_image_url (str) — explicit fallback URL. Used when
+            pack_box_break_id is absent OR the DB lookup returns null
+            (legacy animation_type=NULL rows, broken box_break, etc.).
+            At least one of pack_box_break_id / pack_image_url MUST be
+            set, otherwise we have nothing to render.
+        chase_threshold_multiplier (number) — defaults to 10.
+
+    Raises RuntimeError on any validation failure.
     """
+    import uuid as _uuid
+
     if not CONFIG_PATH.exists():
         raise RuntimeError(
             f"Missing {CONFIG_PATH}. Update with current featured pack info; "
             f"see config/featured_pack.json's _comment for the schema."
         )
     raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    required = {"pack_name": str, "pack_price": (int, float), "pack_image_url": str}
+
+    # Strict required fields.
+    required = {"pack_name": str, "pack_price": (int, float)}
     for key, expected_type in required.items():
         if key not in raw:
             raise RuntimeError(f"{CONFIG_PATH} missing key {key!r}")
@@ -131,6 +148,36 @@ def load_featured_pack() -> dict[str, Any]:
             )
     if raw["pack_price"] <= 0:
         raise RuntimeError(f"{CONFIG_PATH} pack_price must be > 0")
+
+    # Pack image: at least one of pack_box_break_id / pack_image_url
+    # must be set. Validate UUID format eagerly so we never substitute
+    # an unsafe string into SQL at lookup time.
+    box_break_id = raw.get("pack_box_break_id")
+    image_url = raw.get("pack_image_url")
+    if not box_break_id and not image_url:
+        raise RuntimeError(
+            f"{CONFIG_PATH} must set at least one of pack_box_break_id "
+            f"or pack_image_url"
+        )
+    if box_break_id is not None:
+        if not isinstance(box_break_id, str):
+            raise RuntimeError(
+                f"{CONFIG_PATH} pack_box_break_id must be a UUID string, "
+                f"got {type(box_break_id).__name__}"
+            )
+        try:
+            _uuid.UUID(box_break_id)
+        except (ValueError, AttributeError) as e:
+            raise RuntimeError(
+                f"{CONFIG_PATH} pack_box_break_id is not a valid UUID: "
+                f"{box_break_id!r}"
+            ) from e
+    if image_url is not None and not isinstance(image_url, str):
+        raise RuntimeError(
+            f"{CONFIG_PATH} pack_image_url must be a string when set, "
+            f"got {type(image_url).__name__}"
+        )
+
     # Optional multiplier — default to 10 for backward compatibility.
     mult = raw.get("chase_threshold_multiplier", DEFAULT_CHASE_THRESHOLD_MULTIPLIER)
     if not isinstance(mult, (int, float)) or mult <= 0:
@@ -140,6 +187,85 @@ def load_featured_pack() -> dict[str, Any]:
         )
     raw["chase_threshold_multiplier"] = mult
     return raw
+
+
+def resolve_pack_image(pack: dict[str, Any]) -> str:
+    """Resolve the pack image URL to use for rendering.
+
+    If `pack_box_break_id` is set in config, query box_breaks for that
+    row's `reveal_animation_data->>'packImage'` — the canonical "custom
+    pack image" set in Drip's admin panel. This is buried in JSONB
+    and won't appear in any column-level scan (discovered 2026-05-14).
+
+    Fall back to `pack_image_url` from config when:
+      - pack_box_break_id is absent
+      - the box_break row doesn't exist
+      - the box_break row exists but has no packImage key (legacy rows
+        with animation_type=NULL)
+
+    Raises RuntimeError only when BOTH lookup and fallback fail — i.e.
+    there's nothing to render. Single-resolved-string return keeps the
+    render call site clean.
+    """
+    box_break_id = pack.get("pack_box_break_id")
+    fallback_url = pack.get("pack_image_url")
+
+    if not box_break_id:
+        if not fallback_url:
+            raise RuntimeError(
+                "No pack_box_break_id and no pack_image_url in config — "
+                "nothing to render."
+            )
+        log.info("Pack image: using config pack_image_url (no box_break_id set)")
+        return fallback_url
+
+    # UUID format already validated at load time (see load_featured_pack).
+    sql_template = SQL_PACK_IMAGE_PATH.read_text(encoding="utf-8")
+    sql_text = sql_template.replace(":box_break_id", box_break_id)
+    if ":box_break_id" in sql_text:
+        raise RuntimeError("Failed to substitute :box_break_id in pack_image_lookup.sql")
+
+    try:
+        rows = _call_mcp(_build_prompt(sql_text), label="pack-image")
+    except Exception as e:  # noqa: BLE001 — fall back rather than fail
+        log.warning(
+            "Pack image DB lookup failed (%s); falling back to config "
+            "pack_image_url.", e,
+        )
+        if fallback_url:
+            return fallback_url
+        raise
+
+    if not rows:
+        log.warning(
+            "box_break %s returned no rows (or no packImage key); "
+            "falling back to config pack_image_url.", box_break_id,
+        )
+        if not fallback_url:
+            raise RuntimeError(
+                f"box_break {box_break_id} has no packImage AND config has "
+                f"no pack_image_url fallback — nothing to render."
+            )
+        return fallback_url
+
+    resolved = rows[0].get("pack_image_url")
+    if not resolved:
+        log.warning(
+            "box_break %s row has null packImage; falling back to config "
+            "pack_image_url.", box_break_id,
+        )
+        if not fallback_url:
+            raise RuntimeError(
+                f"box_break {box_break_id} has null packImage AND config "
+                f"has no pack_image_url fallback — nothing to render."
+            )
+        return fallback_url
+
+    log.info(
+        "Pack image: resolved from box_break %s (%r): %s",
+        box_break_id, rows[0].get("title", "?"), resolved,
+    )
+    return resolved
 
 
 # --------------------------------------------------------------------------- #
@@ -585,12 +711,19 @@ def run() -> int:
             return 1
         return 0
 
+    # --- Resolve pack image (DB-driven if pack_box_break_id set) -----------
+    try:
+        pack_image_url = resolve_pack_image(pack)
+    except Exception as e:  # noqa: BLE001
+        _emit_failure_to_slack("Pack image resolution failed", e)
+        return 1
+
     # --- Render -------------------------------------------------------------
     try:
         pack_name_render = string_transforms.pack_name_for_canva(pack["pack_name"])
         png_bytes = render_post_to_bytes(
             card_image_url=hit["card_image_url"],
-            pack_image_url=pack["pack_image_url"],
+            pack_image_url=pack_image_url,
             pack_name=pack_name_render,
             hit_value=float(hit["hit_value"]),
         )
