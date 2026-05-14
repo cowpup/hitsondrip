@@ -182,14 +182,19 @@ async function publishPost(postId: string, env: Env): Promise<true> {
   const updated = sanitizeForPut(post);
   updated.autoPublish = true;
   updated.draft = false;
-  // Also flip the nested autoPublish on each network-specific data block.
-  // Without this, IG (and X) sometimes stay in pending even when the
-  // top-level flag is true — Metricool reads the nested one for some
-  // publish-eligibility checks.
+  // Flip the nested autoPublish ONLY on network-specific data blocks
+  // that ALREADY had that key in the GET response. Adding the field to
+  // blocks that don't recognize it (e.g. twitterData) causes Metricool's
+  // deserializer to bail with "Unrecognized field autoPublish, not
+  // marked as ignorable". Currently only instagramData has it, but we
+  // probe all four in case Metricool adds it to others later.
   for (const dataKey of ["instagramData", "twitterData", "facebookData", "threadsData"]) {
     const block = updated[dataKey];
     if (block && typeof block === "object") {
-      updated[dataKey] = { ...(block as Record<string, unknown>), autoPublish: true };
+      const blockObj = block as Record<string, unknown>;
+      if ("autoPublish" in blockObj) {
+        updated[dataKey] = { ...blockObj, autoPublish: true };
+      }
     }
   }
 
