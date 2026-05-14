@@ -213,13 +213,77 @@ def build_caption(hit: dict[str, Any]) -> str:
     )
 
 
+def build_x_caption(hit: dict[str, Any]) -> str:
+    """X (Twitter) caption — Option A: punchy, leads with dollar value.
+
+    Hashtags include a dynamic grade tag derived from the cleaned card name
+    (e.g. "#PSA10", "#CGC9"). Total length stays well under 280 chars even
+    for the longest pack + card names we've seen (~150 chars at most).
+
+    Format:
+        $X HIT 🎯
+
+        <Clean Card Name>
+        from <Clean Pack Name>
+
+        Rip yours → dripshop.live
+
+        #PokemonTCG #PokemonHits #<Grade>
+    """
+    clean_card = string_transforms.card_name_cleanup(hit.get("card_name") or "")
+    clean_pack = string_transforms.pack_name_for_caption(
+        hit.get("pack_name") or FALLBACK_PACK_NAME
+    )
+    hit_value = int(round(float(hit["hit_value"])))
+    grade_hashtag = _grade_hashtag(clean_card)
+
+    return (
+        f"${hit_value} HIT 🎯\n"
+        f"\n"
+        f"{clean_card}\n"
+        f"from {clean_pack}\n"
+        f"\n"
+        f"Rip yours → dripshop.live\n"
+        f"\n"
+        f"#PokemonTCG #PokemonHits {grade_hashtag}"
+    )
+
+
+def _grade_hashtag(clean_card_name: str) -> str:
+    """Extract '#PSA10', '#CGC9', etc. from a cleaned card name.
+
+    The cleaned name starts with "<GRADER> <GRADE> <Rest>" (per
+    card_name_cleanup), so the first two whitespace-separated tokens
+    give us the hashtag. Falls back to "#PokemonCards" if the name
+    doesn't start with a recognizable grader.
+    """
+    if not clean_card_name:
+        return "#PokemonCards"
+    tokens = clean_card_name.split()
+    if len(tokens) < 2:
+        return "#PokemonCards"
+    grader, grade = tokens[0], tokens[1]
+    if grader.upper() in {"PSA", "CGC", "BGS", "BCCG", "TAG"}:
+        # Strip any decimal point from "9.5" → "95" so the hashtag is clean.
+        grade_clean = grade.replace(".", "")
+        return f"#{grader.upper()}{grade_clean}"
+    return "#PokemonCards"
+
+
 def build_slack_success_text(
     hit: dict[str, Any],
     image_url: str,
     publish_at_iso: str,
     metricool_response: Optional[dict[str, Any]] = None,
+    *,
+    x_publish_at_iso: Optional[str] = None,
 ) -> str:
-    """Single line of mrkdwn for the Slack success notification."""
+    """Single mrkdwn block for the Slack success notification.
+
+    Includes the X cross-post line only when it was successfully scheduled
+    (x_publish_at_iso != None). Failed X schedules are logged but don't
+    surface in the Slack text — the IG post is the headline.
+    """
     clean_card = string_transforms.card_name_cleanup(hit.get("card_name") or "")
     clean_pack = string_transforms.pack_name_for_caption(
         hit.get("pack_name") or FALLBACK_PACK_NAME
@@ -227,21 +291,27 @@ def build_slack_success_text(
     hit_value = int(round(float(hit["hit_value"])))
     post_url = ""
     if metricool_response:
-        # Metricool's response shape varies; surface whatever URL/ID we
-        # can find without crashing if the field is absent.
         post_url = (
             metricool_response.get("url")
             or metricool_response.get("postUrl")
             or metricool_response.get("permalink")
             or ""
         )
-    return (
-        f":dollar: *${hit_value} hit on {clean_card}* from _{clean_pack}_\n"
-        f":calendar: Scheduled for `{publish_at_iso}` PT on Instagram "
-        f"<https://www.instagram.com/dripshoplive_/|@dripshoplive_>\n"
-        f":frame_with_picture: <{image_url}|raw PNG>"
-        + (f"\n:link: <{post_url}|Metricool post>" if post_url else "")
-    )
+
+    lines = [
+        f":dollar: *${hit_value} hit on {clean_card}* from _{clean_pack}_",
+        f":calendar: IG scheduled for `{publish_at_iso}` PT — "
+        f"<https://www.instagram.com/dripshoplive_/|@dripshoplive_>",
+    ]
+    if x_publish_at_iso:
+        lines.append(
+            f":bird: X scheduled for `{x_publish_at_iso}` PT — "
+            f"<https://x.com/dripshop_live|@dripshop_live>"
+        )
+    lines.append(f":frame_with_picture: <{image_url}|raw PNG>")
+    if post_url:
+        lines.append(f":link: <{post_url}|Metricool post>")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -321,10 +391,31 @@ def run() -> int:
             publish_at=publish_dt,
             timezone=publish_tz,
         )
-        log.info("Scheduled Metricool post for %s %s", publish_iso, publish_tz)
+        log.info("Scheduled Metricool IG post for %s %s", publish_iso, publish_tz)
     except MetricoolError as e:
-        _emit_failure_to_slack("Metricool schedule failed", e)
+        _emit_failure_to_slack("Metricool IG schedule failed", e)
         return 1
+
+    # Schedule X cross-post, staggered 15 minutes after IG (6:15pm PT).
+    # Non-fatal: if X fails, the IG post is already queued and we should
+    # still notify Slack of the IG success.
+    x_publish_iso: Optional[str] = None
+    try:
+        from datetime import timedelta as _td
+        x_publish_dt = publish_dt + _td(minutes=15)
+        x_publish_iso = x_publish_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        x_caption = build_x_caption(hit)
+        metricool.schedule_x_post(
+            blog_id=blog_id,
+            caption=x_caption,
+            media_url=image_url,
+            publish_at=x_publish_dt,
+            timezone=publish_tz,
+        )
+        log.info("Scheduled Metricool X post for %s %s", x_publish_iso, publish_tz)
+    except MetricoolError as e:
+        log.warning("X cross-post failed (non-fatal, IG still scheduled): %s", e)
+        x_publish_iso = None
 
     # Normalize — snapshot image to Metricool CDN so the GitHub URL can
     # be overwritten tomorrow without affecting tonight's publish.
@@ -339,7 +430,8 @@ def run() -> int:
     # Notify Slack
     try:
         slack_text = build_slack_success_text(
-            hit, image_url, publish_iso, mc_response
+            hit, image_url, publish_iso, mc_response,
+            x_publish_at_iso=x_publish_iso,
         )
         slack.post_message(slack_text, image_url=image_url)
         log.info("Slack notified")

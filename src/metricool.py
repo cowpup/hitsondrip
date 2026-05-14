@@ -292,6 +292,81 @@ def schedule_instagram_post(
     )
 
 
+def schedule_x_post(
+    blog_id: int,
+    caption: str,
+    media_url: str,
+    publish_at: datetime,
+    timezone: str = "America/Los_Angeles",
+    *,
+    draft: bool = False,
+    auto_publish: bool = True,
+) -> dict[str, Any]:
+    """Schedule a single X (Twitter) post — same Metricool endpoint, different network code.
+
+    The Drip TCG brand (blog_id=1909358) has X connected via
+    networksData.twitterData = "dripshop_live" — verified 2026-05-14
+    via list_brands(). Metricool's API still uses the legacy "twitter"
+    network code even though the product is now X.
+
+    Args:
+        blog_id: Metricool blog ID.
+        caption: X post text. Should fit 280 chars unless the account is
+            X Premium (then 25k). Metricool does NOT auto-truncate; over-long
+            text results in an API error.
+        media_url: Public image URL.
+        publish_at: Naive wall-clock datetime in `timezone` (Metricool quirk;
+            see schedule_instagram_post docstring).
+        timezone: IANA timezone, default America/Los_Angeles.
+        draft: When True, post stays in Metricool drafts (no publish).
+        auto_publish: When True, post auto-publishes at the scheduled time.
+
+    Returns the Metricool response (includes the new post's ID + uuid).
+    Raises MetricoolError on failure.
+    """
+    if publish_at.tzinfo is not None:
+        raise MetricoolError(
+            "publish_at must be a naive datetime (no tzinfo); the timezone "
+            "is passed separately."
+        )
+    if len(caption) > 280:
+        # X has a 280-char limit for non-premium accounts. Surface this
+        # before the API rejects it — easier to debug locally than via
+        # Metricool's error response.
+        raise MetricoolError(
+            f"X caption is {len(caption)} chars; max 280 for non-premium "
+            f"accounts. First 100 chars: {caption[:100]!r}"
+        )
+
+    body: dict[str, Any] = {
+        "text": caption,
+        "media": [media_url],
+        "mediaAltText": [],
+        "providers": [{"network": "twitter"}],
+        "publicationDate": {
+            "dateTime": publish_at.strftime("%Y-%m-%dT%H:%M:%S"),
+            "timezone": timezone,
+        },
+        "autoPublish": auto_publish,
+        "draft": draft,
+        "firstCommentText": "",
+        "hasNotReadNotes": False,
+        "shortener": False,
+        "smartLinkData": {"ids": []},
+        "descendants": [],
+        # Twitter-specific config block. The "type" field signals a
+        # normal post (not a thread or reply).
+        "twitterData": {"type": "POST"},
+    }
+
+    return _request(
+        "POST",
+        "/v2/scheduler/posts",
+        params={"blogId": blog_id},
+        json_body=body,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Image URL snapshot
 # --------------------------------------------------------------------------- #
