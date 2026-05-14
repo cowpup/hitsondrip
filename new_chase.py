@@ -76,7 +76,7 @@ PROMPT_PATH = Path("prompt_chase.md")
 SQL_FRESHNESS_PATH = Path("queries") / "new_chase_freshness.sql"
 SQL_MAIN_PATH = Path("queries") / "new_chase.sql"
 SQL_NEAR_MISS_PATH = Path("queries") / "new_chase_near_miss.sql"
-SQL_PACK_IMAGE_PATH = Path("queries") / "pack_image_lookup.sql"
+SQL_PACK_LOOKUP_BY_CARD_PATH = Path("queries") / "pack_lookup_by_card.sql"
 CONFIG_PATH = Path("config") / "featured_pack.json"
 
 ANTHROPIC_MODEL = "claude-opus-4-7"
@@ -110,73 +110,26 @@ DEFAULT_CHASE_THRESHOLD_MULTIPLIER = 10
 def load_featured_pack() -> dict[str, Any]:
     """Load and validate config/featured_pack.json.
 
-    Required keys: pack_name (str), pack_price (positive number).
-    Optional keys:
-        pack_box_break_id (UUID string) — if set, new_chase.py queries
-            box_breaks.reveal_animation_data->>'packImage' at runtime
-            to get the canonical "custom pack image" set in Drip's
-            admin panel. Validated as a UUID at load time to make any
-            mistake fail fast (and to make later string substitution
-            into SQL injection-safe).
-        pack_image_url (str) — explicit fallback URL. Used when
-            pack_box_break_id is absent OR the DB lookup returns null
-            (legacy animation_type=NULL rows, broken box_break, etc.).
-            At least one of pack_box_break_id / pack_image_url MUST be
-            set, otherwise we have nothing to render.
-        chase_threshold_multiplier (number) — defaults to 10.
+    Required: pack_price (positive number).
+    Optional: chase_threshold_multiplier (number; default 10).
+
+    Pack metadata (name + image) is no longer in config — it's
+    auto-resolved per-candidate via the collection→box_break chain
+    (resolve_pack_for_card). pack_price is now a GLOBAL threshold
+    reference, not the actual rendered pack's price.
 
     Raises RuntimeError on any validation failure.
     """
-    import uuid as _uuid
-
     if not CONFIG_PATH.exists():
         raise RuntimeError(
-            f"Missing {CONFIG_PATH}. Update with current featured pack info; "
-            f"see config/featured_pack.json's _comment for the schema."
+            f"Missing {CONFIG_PATH}. See _comment for the schema."
         )
     raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
-    # Strict required fields.
-    required = {"pack_name": str, "pack_price": (int, float)}
-    for key, expected_type in required.items():
-        if key not in raw:
-            raise RuntimeError(f"{CONFIG_PATH} missing key {key!r}")
-        if not isinstance(raw[key], expected_type):
-            raise RuntimeError(
-                f"{CONFIG_PATH} key {key!r} has wrong type: "
-                f"expected {expected_type}, got {type(raw[key]).__name__}"
-            )
-    if raw["pack_price"] <= 0:
-        raise RuntimeError(f"{CONFIG_PATH} pack_price must be > 0")
-
-    # Pack image: at least one of pack_box_break_id / pack_image_url
-    # must be set. Validate UUID format eagerly so we never substitute
-    # an unsafe string into SQL at lookup time.
-    box_break_id = raw.get("pack_box_break_id")
-    image_url = raw.get("pack_image_url")
-    if not box_break_id and not image_url:
-        raise RuntimeError(
-            f"{CONFIG_PATH} must set at least one of pack_box_break_id "
-            f"or pack_image_url"
-        )
-    if box_break_id is not None:
-        if not isinstance(box_break_id, str):
-            raise RuntimeError(
-                f"{CONFIG_PATH} pack_box_break_id must be a UUID string, "
-                f"got {type(box_break_id).__name__}"
-            )
-        try:
-            _uuid.UUID(box_break_id)
-        except (ValueError, AttributeError) as e:
-            raise RuntimeError(
-                f"{CONFIG_PATH} pack_box_break_id is not a valid UUID: "
-                f"{box_break_id!r}"
-            ) from e
-    if image_url is not None and not isinstance(image_url, str):
-        raise RuntimeError(
-            f"{CONFIG_PATH} pack_image_url must be a string when set, "
-            f"got {type(image_url).__name__}"
-        )
+    if "pack_price" not in raw:
+        raise RuntimeError(f"{CONFIG_PATH} missing key 'pack_price'")
+    if not isinstance(raw["pack_price"], (int, float)) or raw["pack_price"] <= 0:
+        raise RuntimeError(f"{CONFIG_PATH} pack_price must be a positive number")
 
     # Optional multiplier — default to 10 for backward compatibility.
     mult = raw.get("chase_threshold_multiplier", DEFAULT_CHASE_THRESHOLD_MULTIPLIER)
@@ -189,83 +142,44 @@ def load_featured_pack() -> dict[str, Any]:
     return raw
 
 
-def resolve_pack_image(pack: dict[str, Any]) -> str:
-    """Resolve the pack image URL to use for rendering.
+def resolve_pack_for_card(card_product_id: int) -> Optional[dict[str, Any]]:
+    """Auto-resolve the pack for a chase card via the collection chain:
 
-    If `pack_box_break_id` is set in config, query box_breaks for that
-    row's `reveal_animation_data->>'packImage'` — the canonical "custom
-    pack image" set in Drip's admin panel. This is buried in JSONB
-    and won't appear in any column-level scan (discovered 2026-05-14).
+        products.id
+          → user_product_collection_product_mappings.product_id
+            → user_product_collections.id
+              → box_break_spot_mappings.collection_id
+                → box_breaks.id
 
-    Fall back to `pack_image_url` from config when:
-      - pack_box_break_id is absent
-      - the box_break row doesn't exist
-      - the box_break row exists but has no packImage key (legacy rows
-        with animation_type=NULL)
+    Tiebreaker (a collection feeds many packs over time): the most-
+    recent box_break with packImage in its JSONB.
 
-    Raises RuntimeError only when BOTH lookup and fallback fail — i.e.
-    there's nothing to render. Single-resolved-string return keeps the
-    render call site clean.
+    Returns a dict with keys {box_break_id, pack_title, pack_image_url,
+    collection_id, collection_name} on success, or None when the card
+    has no collection mapping (missing tags / no matching dynamic
+    conditions) or none of its collections feed any box_break with a
+    packImage. Caller should try the next candidate.
+
+    Never raises for "no mapping" — that's the expected miss case.
+    Raises only on infrastructure failures.
     """
-    box_break_id = pack.get("pack_box_break_id")
-    fallback_url = pack.get("pack_image_url")
-
-    if not box_break_id:
-        if not fallback_url:
-            raise RuntimeError(
-                "No pack_box_break_id and no pack_image_url in config — "
-                "nothing to render."
-            )
-        log.info("Pack image: using config pack_image_url (no box_break_id set)")
-        return fallback_url
-
-    # UUID format already validated at load time (see load_featured_pack).
-    sql_template = SQL_PACK_IMAGE_PATH.read_text(encoding="utf-8")
-    sql_text = sql_template.replace(":box_break_id", box_break_id)
-    if ":box_break_id" in sql_text:
-        raise RuntimeError("Failed to substitute :box_break_id in pack_image_lookup.sql")
-
-    try:
-        rows = _call_mcp(_build_prompt(sql_text), label="pack-image")
-    except Exception as e:  # noqa: BLE001 — fall back rather than fail
-        log.warning(
-            "Pack image DB lookup failed (%s); falling back to config "
-            "pack_image_url.", e,
+    sql_template = SQL_PACK_LOOKUP_BY_CARD_PATH.read_text(encoding="utf-8")
+    sql_text = sql_template.replace(":card_product_id", str(int(card_product_id)))
+    if ":card_product_id" in sql_text:
+        raise RuntimeError(
+            "Failed to substitute :card_product_id in pack_lookup_by_card.sql"
         )
-        if fallback_url:
-            return fallback_url
-        raise
 
+    rows = _call_mcp(_build_prompt(sql_text), label=f"pack-resolve[{card_product_id}]")
     if not rows:
-        log.warning(
-            "box_break %s returned no rows (or no packImage key); "
-            "falling back to config pack_image_url.", box_break_id,
-        )
-        if not fallback_url:
-            raise RuntimeError(
-                f"box_break {box_break_id} has no packImage AND config has "
-                f"no pack_image_url fallback — nothing to render."
-            )
-        return fallback_url
-
-    resolved = rows[0].get("pack_image_url")
-    if not resolved:
-        log.warning(
-            "box_break %s row has null packImage; falling back to config "
-            "pack_image_url.", box_break_id,
-        )
-        if not fallback_url:
-            raise RuntimeError(
-                f"box_break {box_break_id} has null packImage AND config "
-                f"has no pack_image_url fallback — nothing to render."
-            )
-        return fallback_url
-
-    log.info(
-        "Pack image: resolved from box_break %s (%r): %s",
-        box_break_id, rows[0].get("title", "?"), resolved,
-    )
-    return resolved
+        return None
+    row = rows[0]
+    if not row.get("pack_image_url"):
+        # Defensive: SQL has `bb.reveal_animation_data ? 'packImage'`
+        # so we shouldn't see a null URL, but a JSONB key with null
+        # value would slip past that filter.
+        return None
+    return row
 
 
 # --------------------------------------------------------------------------- #
@@ -449,9 +363,14 @@ def build_ig_caption(hit: dict[str, Any], pack: dict[str, Any]) -> str:
 
     Format: "$X chase just dropped — <Card Name> now available in
     <Pack Name>. Rip yours at dripshop.live"
+
+    `pack` is the chain-resolved pack dict (keys include `pack_title`
+    from box_breaks). Falls back to config-style `pack_name` for
+    backward compat with tests.
     """
     clean_card = string_transforms.card_name_cleanup(hit.get("card_name") or "")
-    clean_pack = string_transforms.pack_name_for_caption(pack["pack_name"])
+    pack_title = pack.get("pack_title") or pack.get("pack_name") or ""
+    clean_pack = string_transforms.pack_name_for_caption(pack_title)
     hit_value = int(round(float(hit["hit_value"])))
     return (
         f"${hit_value} chase just dropped — {clean_card} now available "
@@ -473,7 +392,8 @@ def build_x_caption(hit: dict[str, Any], pack: dict[str, Any]) -> str:
         #PokemonTCG #ChaseCard #<Grade>
     """
     clean_card = string_transforms.card_name_cleanup(hit.get("card_name") or "")
-    clean_pack = string_transforms.pack_name_for_caption(pack["pack_name"])
+    pack_title = pack.get("pack_title") or pack.get("pack_name") or ""
+    clean_pack = string_transforms.pack_name_for_caption(pack_title)
     hit_value = int(round(float(hit["hit_value"])))
     grade_hashtag = _grade_hashtag(clean_card)
 
@@ -512,13 +432,14 @@ def build_slack_success_text(
 ) -> str:
     """Single mrkdwn block for the Slack approval notification."""
     clean_card = string_transforms.card_name_cleanup(hit.get("card_name") or "")
-    clean_pack = string_transforms.pack_name_for_caption(pack["pack_name"])
+    pack_title = pack.get("pack_title") or pack.get("pack_name") or ""
+    clean_pack = string_transforms.pack_name_for_caption(pack_title)
     hit_value = int(round(float(hit["hit_value"])))
     ratio = float(hit["hit_value"]) / float(pack["pack_price"])
 
     return "\n".join([
         f":dart: *${hit_value} chase on {clean_card}* "
-        f"(_{ratio:.1f}×_ the ${pack['pack_price']} pack price)",
+        f"(_{ratio:.1f}×_ the ${pack['pack_price']} reference pack price)",
         f":pick: Available in _{clean_pack}_",
         f":calendar: IG would publish at `{publish_at_iso}` PT — "
         f"<https://www.instagram.com/dripshoplive_/|@dripshoplive_>",
@@ -585,7 +506,7 @@ def _slack_no_qualifying(
         f":no_entry_sign: *Skipping New Chase post — no qualifying chase.*\n"
         f"Threshold: card.price ≥ *${int(threshold)}* "
         f"({pack['chase_threshold_multiplier']}× the ${pack['pack_price']} "
-        f"featured pack price)."
+        f"reference pack price)."
     )
     if near_miss is None:
         slack.post_message(base + "\n_Latest batch was empty._")
@@ -596,21 +517,30 @@ def _slack_no_qualifying(
     slack.post_message(
         base
         + f"\nTop card in latest batch was *${int(top_value)}* on "
-        + f"_{top_card}_ ({top_ratio:.1f}× the pack price).\n"
+        + f"_{top_card}_ ({top_ratio:.1f}× the reference pack price).\n"
         + "_If this looks postable, lower `pack_price` in "
         + "`config/featured_pack.json` so the threshold drops._"
     )
 
 
-def _slack_already_shown(card_id: int, hit: dict[str, Any]) -> None:
-    """Skip message: candidate card was already presented to Noah on a
-    previous run. Could be a quiet weekend repeating the same batch."""
-    clean_card = string_transforms.card_name_cleanup(hit.get("card_name") or "")
+def _slack_no_usable_candidate(
+    candidates: list[dict[str, Any]],
+    skip_reasons: list[tuple[dict[str, Any], str]],
+) -> None:
+    """Skip message: every qualifying candidate either lacked a pack
+    mapping (no collection match / no matching dynamic conditions) OR
+    matched the previously-shown card. Surfaces enough info for Noah
+    to diagnose (missing tags, broken collection, etc.)."""
+    lines = ["    " + f"${c.get('hit_value')} on {(c.get('card_name') or '?')[:60]} — {r}"
+             for c, r in skip_reasons]
+    detail = "\n".join(lines) if lines else "    (no detail)"
     slack.post_message(
-        f":repeat: *Skipping New Chase post — already shown.*\n"
-        f"Top chase is _{clean_card}_ (id `{card_id}`), which matches "
-        f"`state/last_chase_card_id.txt` from a previous run.\n"
-        f"_Waiting for a new batch with a different top card._"
+        f":mag: *Skipping New Chase post — no usable candidate.*\n"
+        f"All {len(candidates)} top candidates failed pack resolution "
+        f"or de-dup:\n```{detail}```\n"
+        f"_Common cause: candidate cards are missing the tags that "
+        f"feed `user_product_collections.dynamic_conditions`. Add the "
+        f"right tags via admin panel and the next run will pick them up._"
     )
 
 
@@ -627,9 +557,9 @@ def run() -> int:
         _emit_failure_to_slack("Load featured-pack config failed", e)
         return 1
     log.info(
-        "Featured pack: %r @ $%s (multiplier=%s×) — %s",
-        pack["pack_name"], pack["pack_price"],
-        pack["chase_threshold_multiplier"], pack["pack_image_url"],
+        "Reference pack price: $%s, multiplier=%s× → threshold $%s",
+        pack["pack_price"], pack["chase_threshold_multiplier"],
+        float(pack["chase_threshold_multiplier"]) * float(pack["pack_price"]),
     )
 
     threshold = float(pack["chase_threshold_multiplier"]) * float(pack["pack_price"])
@@ -689,41 +619,93 @@ def run() -> int:
             return 1
         return 0
 
-    hit = candidates[0]
-    card_product_id = int(hit["card_product_id"])
-    log.info(
-        "Candidate: $%s on %s (id=%s)",
-        hit.get("hit_value"), hit.get("card_name"), card_product_id,
-    )
-
-    # --- De-dup gate --------------------------------------------------------
+    # --- Read state (used by the candidate dedup check below) --------------
     try:
         last_card_id = state_branch.read_last_card_id()
     except StateBranchError as e:
         _emit_failure_to_slack("State branch read failed", e)
         return 1
     log.info("Last posted card_id: %r", last_card_id)
-    if last_card_id is not None and last_card_id == card_product_id:
+
+    # --- Candidate selection loop ------------------------------------------
+    # Iterate top-N candidates in price-DESC order. For each:
+    #   1. Skip if dedup matches state (same card we showed last run)
+    #   2. Resolve pack via collection chain. If no mapping, skip.
+    #   3. First candidate that clears both checks wins.
+    # If ALL candidates fail, Slack-skip with the per-candidate reasons.
+    hit: Optional[dict[str, Any]] = None
+    resolved_pack: Optional[dict[str, Any]] = None
+    skip_reasons: list[tuple[dict[str, Any], str]] = []
+
+    for candidate in candidates:
+        cand_id = int(candidate["card_product_id"])
+        log.info(
+            "Trying candidate: $%s on %s (id=%s)",
+            candidate.get("hit_value"), candidate.get("card_name"), cand_id,
+        )
+
+        if last_card_id is not None and last_card_id == cand_id:
+            log.info("  → matches state's last_card_id, skipping")
+            skip_reasons.append((candidate, "already shown last run"))
+            continue
+
         try:
-            _slack_already_shown(card_product_id, hit)
+            pack_info = resolve_pack_for_card(cand_id)
+        except Exception as e:  # noqa: BLE001
+            # Infrastructure failure (MCP unreachable etc.) — log but
+            # don't abort; try the next candidate. If ALL fail with
+            # infrastructure errors we'll fall out of the loop and
+            # surface the issue via the skip message.
+            log.warning("  → pack resolution raised: %s", e)
+            skip_reasons.append((candidate, f"resolve failed: {e}"))
+            continue
+
+        if pack_info is None:
+            log.info("  → no pack mapping (missing tags / no matching collection)")
+            skip_reasons.append((candidate, "no pack mapping"))
+            continue
+
+        log.info(
+            "  → resolved pack: %r (box_break_id=%s, image=%s)",
+            pack_info.get("pack_title"), pack_info.get("box_break_id"),
+            pack_info.get("pack_image_url"),
+        )
+        hit = candidate
+        resolved_pack = pack_info
+        break
+
+    if hit is None or resolved_pack is None:
+        log.warning(
+            "All %d candidates failed pack resolution or dedup.", len(candidates),
+        )
+        try:
+            _slack_no_usable_candidate(candidates, skip_reasons)
         except SlackError as e:
-            log.error("Slack notify failed on already-shown path: %s", e)
+            log.error("Slack notify failed on no-usable path: %s", e)
             return 1
         return 0
 
-    # --- Resolve pack image (DB-driven if pack_box_break_id set) -----------
-    try:
-        pack_image_url = resolve_pack_image(pack)
-    except Exception as e:  # noqa: BLE001
-        _emit_failure_to_slack("Pack image resolution failed", e)
-        return 1
+    card_product_id = int(hit["card_product_id"])
+
+    # Build the merged pack dict that captions + render consume:
+    #   pack_title + pack_image_url come from the chain (per-card)
+    #   pack_price + chase_threshold_multiplier from config (global)
+    pack_for_render = {
+        "pack_title":               resolved_pack["pack_title"],
+        "pack_image_url":           resolved_pack["pack_image_url"],
+        "box_break_id":             resolved_pack["box_break_id"],
+        "pack_price":               pack["pack_price"],
+        "chase_threshold_multiplier": pack["chase_threshold_multiplier"],
+    }
 
     # --- Render -------------------------------------------------------------
     try:
-        pack_name_render = string_transforms.pack_name_for_canva(pack["pack_name"])
+        pack_name_render = string_transforms.pack_name_for_canva(
+            pack_for_render["pack_title"]
+        )
         png_bytes = render_post_to_bytes(
             card_image_url=hit["card_image_url"],
-            pack_image_url=pack_image_url,
+            pack_image_url=pack_for_render["pack_image_url"],
             pack_name=pack_name_render,
             hit_value=float(hit["hit_value"]),
         )
@@ -751,8 +733,8 @@ def run() -> int:
     x_publish_dt = publish_dt + timedelta(minutes=15)
     x_publish_iso = x_publish_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
-    ig_caption = build_ig_caption(hit, pack)
-    x_caption = build_x_caption(hit, pack)
+    ig_caption = build_ig_caption(hit, pack_for_render)
+    x_caption = build_x_caption(hit, pack_for_render)
 
     payload = {
         "image_url": image_url,
@@ -763,7 +745,7 @@ def run() -> int:
 
     try:
         slack_text = build_slack_success_text(
-            hit, pack, image_url, publish_iso, x_publish_iso,
+            hit, pack_for_render, image_url, publish_iso, x_publish_iso,
         )
         slack_text += (
             "\n\n:warning: *Awaiting approval — click ✅ Approve & schedule "

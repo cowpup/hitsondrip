@@ -47,4 +47,4 @@ WHERE p.user_id = 65643
   AND p.created_at <= a.batch_ts
   AND p.price >= :threshold
 ORDER BY p.price DESC NULLS LAST
-LIMIT 1;
+LIMIT 5;
