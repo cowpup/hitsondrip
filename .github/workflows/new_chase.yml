@@ -1,0 +1,73 @@
+# Daily "New Chase" Drip Shop Live → Instagram + X post.
+#
+# Fires at 10am PT every day. Cron timezone is UTC; "0 17 * * *" lands at:
+#   - 10am PDT  (UTC-7, in effect roughly mid-March → early-November)
+#   - 9am  PST  (UTC-8, in effect roughly early-November → mid-March)
+# Same 1-hour winter drift as daily.yml — acceptable because the post
+# itself is always scheduled for 6pm PT same day (DST-stable, see
+# src/schedule_time.py).
+#
+# Two hours BEFORE the daily.yml cron (12pm PT) on purpose: if both
+# automations qualify on the same day, the chase preview lands first
+# in Slack so Noah can approve/skip it before the Just Pulled message
+# crowds it out.
+
+name: new_chase
+
+on:
+  schedule:
+    # 10am PDT / 9am PST → 17:00 UTC year-round.
+    - cron: "0 17 * * *"
+  # Manual trigger for testing or ad-hoc reruns. Also dispatched by
+  # the /newchase Slack slash command via Cloudflare Worker (the
+  # Worker auto-routes by command name to the matching workflow file).
+  workflow_dispatch:
+
+# image_host.py writes to `daily-output` (latest_chase.png);
+# state_branch.py writes to `state` (state/last_chase_card_id.txt).
+permissions:
+  contents: write
+
+# Don't pile up concurrent runs; cancel any older in-flight run when
+# a new manual / scheduled run starts. Independent of the `daily`
+# workflow's concurrency group so the two never block each other.
+concurrency:
+  group: new_chase
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (main branch)
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Sync dependencies
+        run: uv sync --frozen --no-install-project || uv sync
+
+      - name: Run new_chase.py
+        env:
+          ANTHROPIC_API_KEY:      ${{ secrets.ANTHROPIC_API_KEY }}
+          METRICOOL_USER_TOKEN:   ${{ secrets.METRICOOL_USER_TOKEN }}
+          METRICOOL_USER_ID:      ${{ secrets.METRICOOL_USER_ID }}
+          METRICOOL_BLOG_ID:      ${{ secrets.METRICOOL_BLOG_ID }}
+          SLACK_BOT_TOKEN:        ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID:       ${{ secrets.SLACK_CHANNEL_ID }}
+          # image_host.py + state_branch.py share these. The auto-
+          # injected GITHUB_TOKEN has `contents: write` per the
+          # workflow permissions block.
+          GITHUB_TOKEN:           ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO:            ${{ github.repository }}
+          # Freshness guardrail (hours). Override here if Drip's
+          # batch cadence changes. Default is 36 in new_chase.py.
+          # MAX_BATCH_AGE_HOURS:    36
+        run: uv run python -u new_chase.py
