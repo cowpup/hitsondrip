@@ -36,9 +36,8 @@ from typing import Any, Optional
 import anthropic
 from dotenv import load_dotenv
 
-from src import metricool, schedule_time, slack, string_transforms
+from src import schedule_time, slack, string_transforms
 from src.image_host import publish_to_github, ImageHostError
-from src.metricool import MetricoolError
 from src.renderer import RenderError, render_just_pulled
 from src.slack import SlackError
 
@@ -274,43 +273,32 @@ def build_slack_success_text(
     hit: dict[str, Any],
     image_url: str,
     publish_at_iso: str,
-    metricool_response: Optional[dict[str, Any]] = None,
     *,
     x_publish_at_iso: Optional[str] = None,
 ) -> str:
     """Single mrkdwn block for the Slack success notification.
 
-    Includes the X cross-post line only when it was successfully scheduled
-    (x_publish_at_iso != None). Failed X schedules are logged but don't
-    surface in the Slack text — the IG post is the headline.
+    Shows the candidate hit, the proposed publish times, and a link to
+    the raw PNG. Nothing is actually scheduled on Metricool yet — the
+    Worker POSTs to Metricool only after ✅ is clicked.
     """
     clean_card = string_transforms.card_name_cleanup(hit.get("card_name") or "")
     clean_pack = string_transforms.pack_name_for_caption(
         hit.get("pack_name") or FALLBACK_PACK_NAME
     )
     hit_value = int(round(float(hit["hit_value"])))
-    post_url = ""
-    if metricool_response:
-        post_url = (
-            metricool_response.get("url")
-            or metricool_response.get("postUrl")
-            or metricool_response.get("permalink")
-            or ""
-        )
 
     lines = [
         f":dollar: *${hit_value} hit on {clean_card}* from _{clean_pack}_",
-        f":calendar: IG scheduled for `{publish_at_iso}` PT — "
+        f":calendar: IG would publish at `{publish_at_iso}` PT — "
         f"<https://www.instagram.com/dripshoplive_/|@dripshoplive_>",
     ]
     if x_publish_at_iso:
         lines.append(
-            f":bird: X scheduled for `{x_publish_at_iso}` PT — "
+            f":bird: X would publish at `{x_publish_at_iso}` PT — "
             f"<https://x.com/dripshop_live|@dripshop_live>"
         )
     lines.append(f":frame_with_picture: <{image_url}|raw PNG>")
-    if post_url:
-        lines.append(f":link: <{post_url}|Metricool post>")
     return "\n".join(lines)
 
 
@@ -368,157 +356,104 @@ def run() -> int:
         _emit_failure_to_slack("Image host upload failed", e)
         return 1
 
-    # Schedule on Metricool. blog_id comes from METRICOOL_BLOG_ID env var
-    # (set per the briefing as 1909358 = Drip TCG brand). Calling
-    # find_instagram_brand() would also work but adds an extra Metricool
-    # API call to discover an ID we already know.
-    try:
-        publish_iso, publish_tz = schedule_time.next_6pm_pt()
-        from datetime import datetime as _dt
-        publish_dt = _dt.fromisoformat(publish_iso)
+    # Build the post payload for Slack-button-driven approval. The Slack
+    # message carries everything the Cloudflare Worker needs to create
+    # the Metricool posts on approve — caption, image URL, publish time
+    # for both IG and X — base64-encoded into the button value.
+    #
+    # NOTHING goes to Metricool here. The Worker creates posts (with
+    # autoPublish=true) only after a human clicks ✅ in Slack. This
+    # eliminates the "duplicate posts" risk from previous architectures
+    # that scheduled drafts up front, and also removes the need for a
+    # fail-closed cleanup cron — no Metricool state exists to clean up.
+    publish_iso, publish_tz = schedule_time.next_6pm_pt()
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+    publish_dt = _dt.fromisoformat(publish_iso)
+    x_publish_dt = publish_dt + _td(minutes=15)
+    x_publish_iso = x_publish_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
-        blog_id_raw = os.environ.get("METRICOOL_BLOG_ID")
-        if not blog_id_raw:
-            raise MetricoolError(
-                "METRICOOL_BLOG_ID not set — required for schedule_instagram_post"
-            )
-        blog_id = int(blog_id_raw)
-        caption = build_caption(hit)
-        # IG scheduled as auto_publish=False — sits in queue awaiting Slack
-        # approval. The Cloudflare Worker flips auto_publish=True when
-        # someone clicks ✅ in Slack. If 5:55pm PT passes with no approval,
-        # cleanup.py deletes the draft (fail-closed).
-        mc_response = metricool.schedule_instagram_post(
-            blog_id=blog_id,
-            caption=caption,
-            media_url=image_url,
-            publish_at=publish_dt,
-            timezone=publish_tz,
-            auto_publish=False,
-        )
-        ig_post_id = _extract_post_id(mc_response)
-        log.info(
-            "Scheduled Metricool IG post (id=%s, auto_publish=False) for %s %s",
-            ig_post_id, publish_iso, publish_tz,
-        )
-    except MetricoolError as e:
-        _emit_failure_to_slack("Metricool IG schedule failed", e)
-        return 1
+    ig_caption = build_caption(hit)
+    x_caption = build_x_caption(hit)
 
-    # Schedule X cross-post, staggered 15 minutes after IG (6:15pm PT).
-    # Non-fatal: if X fails, the IG post is already queued and we should
-    # still notify Slack of the IG success.
-    x_publish_iso: Optional[str] = None
-    x_post_id: Optional[str] = None
-    try:
-        from datetime import timedelta as _td
-        x_publish_dt = publish_dt + _td(minutes=15)
-        x_publish_iso = x_publish_dt.strftime("%Y-%m-%dT%H:%M:%S")
-        x_caption = build_x_caption(hit)
-        x_response = metricool.schedule_x_post(
-            blog_id=blog_id,
-            caption=x_caption,
-            media_url=image_url,
-            publish_at=x_publish_dt,
-            timezone=publish_tz,
-            auto_publish=False,
-        )
-        x_post_id = _extract_post_id(x_response)
-        log.info(
-            "Scheduled Metricool X post (id=%s) for %s %s",
-            x_post_id, x_publish_iso, publish_tz,
-        )
-    except MetricoolError as e:
-        log.warning("X cross-post failed (non-fatal, IG still scheduled): %s", e)
-        x_publish_iso = None
-        x_post_id = None
+    payload = {
+        "image_url": image_url,
+        "timezone": publish_tz,
+        "ig": {"caption": ig_caption, "publish": publish_iso},
+        "x":  {"caption": x_caption,  "publish": x_publish_iso},
+    }
 
-    # Normalize — snapshot image to Metricool CDN so the GitHub URL can
-    # be overwritten tomorrow without affecting tonight's publish.
-    try:
-        metricool.normalize_image_url(image_url)
-        log.info("Image normalized onto Metricool CDN")
-    except MetricoolError as e:
-        # Not fatal — the post is already scheduled with the original
-        # GitHub URL. Log and continue.
-        log.warning("normalize_image_url failed (non-fatal): %s", e)
-
-    # Notify Slack with Approve / Skip buttons. The button `value` carries
-    # both Metricool post IDs so the Cloudflare Worker can act on them
-    # without needing extra state — format is "<action>:<igPostId>:<xPostId>"
-    # where xPostId is "none" when the X schedule failed earlier.
     try:
         slack_text = build_slack_success_text(
-            hit, image_url, publish_iso, mc_response,
+            hit, image_url, publish_iso,
             x_publish_at_iso=x_publish_iso,
         )
         slack_text += (
-            "\n\n:warning: *Awaiting approval — click below before "
-            "5:55pm PT or both posts will be auto-skipped.*"
+            "\n\n:warning: *Awaiting approval — click ✅ Approve & schedule "
+            "to publish both posts at their scheduled times, or ❌ Skip to "
+            "discard today's post entirely.*"
         )
-        buttons = _build_approval_buttons(ig_post_id, x_post_id)
+        buttons = _build_approval_buttons(payload)
         slack.post_message(slack_text, image_url=image_url, actions=buttons)
-        log.info("Slack notified with approval buttons")
+        log.info(
+            "Slack notified with approval buttons (IG %s, X %s)",
+            publish_iso, x_publish_iso,
+        )
     except SlackError as e:
-        # Pipeline succeeded — log but don't fail the run.
-        log.error("Slack notify failed (non-fatal): %s", e)
+        # Render succeeded, image hosted — but we couldn't notify. Fail
+        # the run so we see it in GitHub Actions and don't silently miss
+        # a day.
+        _emit_failure_to_slack("Slack notify failed", e)
+        return 1
 
     return 0
 
 
-def _extract_post_id(response: Optional[dict[str, Any]]) -> Optional[str]:
-    """Pull the Metricool-assigned post ID out of a schedule response.
-
-    Confirmed shape from POST /v2/scheduler/posts (probed 2026-05-14):
-        {"data": {"id": 325889577, "uuid": "...", "publicationDate": {...}, ...}}
-    The post object is wrapped under "data". GET responses for the same
-    endpoint return the post unwrapped — we probe top-level too in case
-    Metricool changes the wrapping later.
-    """
-    if not response:
-        return None
-    # Top-level first (in case the wrapping ever goes away).
-    for key in ("id", "postId", "uuid"):
-        v = response.get(key)
-        if v not in (None, "", 0):
-            return str(v)
-    # Wrapped under "data" (current POST response shape).
-    data = response.get("data")
-    if isinstance(data, dict):
-        for key in ("id", "postId", "uuid"):
-            v = data.get(key)
-            if v not in (None, "", 0):
-                return str(v)
-    return None
-
-
-def _build_approval_buttons(
-    ig_post_id: Optional[str],
-    x_post_id: Optional[str],
-) -> list[dict[str, Any]]:
+def _build_approval_buttons(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Slack button elements for ✅ Approve / ❌ Skip.
 
-    Both buttons encode the IG + X Metricool post IDs in their `value` so
-    the Cloudflare Worker (which has no other state) knows exactly what
-    to publish or delete. X ID falls back to "none" so the Worker can
-    skip the X half cleanly when the cross-post wasn't scheduled.
+    Approve carries the FULL post payload (caption, image URL, publish
+    times for both IG + X) base64-encoded so the Worker can create both
+    Metricool posts on click without needing any other state. The Worker
+    POSTs both with autoPublish=true so they publish at their original
+    scheduled times — no draft, no later update, no duplication risk.
+
+    Skip carries no data — there's nothing to delete since main.py never
+    created any Metricool state.
+
+    Slack's button `value` field is capped at 2000 chars; a typical
+    payload base64-encodes to ~1000 chars (caption ~280 + URL ~80 +
+    timestamps ~50 + JSON syntax ~50 + room for hashtags). Safe margin.
     """
-    ig = ig_post_id or "none"
-    x = x_post_id or "none"
+    import base64
+    import json as _json
+
+    payload_json = _json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    encoded = base64.urlsafe_b64encode(payload_json.encode("utf-8")).decode("ascii")
+    approve_value = f"approve:{encoded}"
+    if len(approve_value) > 1900:
+        # Defensive: Slack rejects button values > 2000 chars. If we're
+        # ever close, the caption is too long and we should fail loudly
+        # so we notice before posting a broken button.
+        raise ValueError(
+            f"Slack button value too long ({len(approve_value)} chars). "
+            f"Trim the caption or image URL."
+        )
+
     return [
         {
             "type": "button",
             "action_id": "approve",
             "style": "primary",
             "text": {"type": "plain_text", "text": "✅ Approve & schedule"},
-            "value": f"approve:{ig}:{x}",
+            "value": approve_value,
         },
         {
             "type": "button",
             "action_id": "reject",
             "style": "danger",
             "text": {"type": "plain_text", "text": "❌ Skip today"},
-            "value": f"reject:{ig}:{x}",
+            "value": "reject",
         },
     ]
 

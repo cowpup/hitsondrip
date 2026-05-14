@@ -1,24 +1,32 @@
 /**
- * Slack interactive endpoint — approves or rejects today's drafted
- * hitsondrip post (IG + X) by calling Metricool.
+ * Slack interactive endpoint — creates today's hitsondrip post(s) on
+ * Metricool only when a human clicks ✅ in Slack.
  *
  * Flow:
- *   1. main.py runs at 12pm PT, schedules IG and X posts as
- *      autoPublish=false drafts on Metricool, then posts to Slack with
- *      two interactive buttons. Each button carries a value of the form
- *      "<approve|reject>:<igPostId>:<xPostId>" (xPostId may be "none"
- *      if the X schedule failed).
- *   2. User clicks Approve or Reject in Slack.
+ *   1. main.py runs at 12pm PT, renders the PNG, uploads to GitHub,
+ *      and posts a Slack message with two interactive buttons. The
+ *      Approve button's `value` is "approve:<base64 of full payload>",
+ *      where the payload is a JSON object with image_url + IG/X caption
+ *      and publish times. The Skip button's `value` is just "reject".
+ *      NOTHING is scheduled on Metricool at this stage.
+ *   2. User clicks Approve or Skip in Slack.
  *   3. Slack POSTs a signed payload to this Worker.
- *   4. We verify the signature, then PUT (approve → autoPublish=true)
- *      or DELETE (reject) each post on Metricool.
+ *   4. We verify the Slack signature, then either:
+ *        Approve: decode the payload, POST both IG + X to Metricool
+ *                 with autoPublish=true so they fire at their scheduled
+ *                 times (6pm PT IG, 6:15pm PT X).
+ *        Reject:  no-op (nothing to delete since nothing was created).
  *   5. We reply in-thread via response_url so the channel sees what
- *      happened.
+ *      happened. The Metricool POSTs happen via ctx.waitUntil() so we
+ *      respond to Slack within 3 seconds even if Metricool is slow.
  *
- * Why this lives in a Worker instead of GitHub Actions:
- *   Slack's interactive endpoint requires a sub-3-second HTTPS response.
- *   GitHub Actions cold-starts take 20-60 seconds. A Worker is the
- *   right fit — runs in tens of milliseconds, free for our volume.
+ * Why no Metricool state until approval:
+ *   Earlier architectures scheduled drafts at 12pm and PUT-updated them
+ *   on approval. Metricool's PUT endpoint surprised us in two ways:
+ *   (a) its 400 response sometimes persists partial fields anyway, and
+ *   (b) PUTs with no `id` in the body create a duplicate post rather
+ *   than updating the URL-path-identified one. Skipping the draft entirely
+ *   sidesteps both quirks and removes the need for a fail-closed cleanup.
  */
 
 export interface Env {
@@ -29,15 +37,21 @@ export interface Env {
 }
 
 const METRICOOL_BASE = "https://app.metricool.com/api";
+const DEFAULT_TIMEZONE = "America/Los_Angeles";
+
+interface PostPayload {
+  image_url: string;
+  timezone?: string;
+  ig: { caption: string; publish: string };
+  x?: { caption: string; publish: string } | null;
+}
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (request.method !== "POST") {
       return new Response("method not allowed", { status: 405 });
     }
 
-    // Slack signs the raw request body. Read it as text BEFORE parsing
-    // so we have the exact bytes Slack signed.
     const body = await request.text();
     const timestamp = request.headers.get("x-slack-request-timestamp");
     const signature = request.headers.get("x-slack-signature");
@@ -46,7 +60,6 @@ export default {
       return new Response("missing slack signature headers", { status: 400 });
     }
 
-    // Reject replays of >5min-old requests (per Slack's recommendation).
     const now = Math.floor(Date.now() / 1000);
     const ts = parseInt(timestamp, 10);
     if (!Number.isFinite(ts) || Math.abs(now - ts) > 60 * 5) {
@@ -61,212 +74,214 @@ export default {
       return new Response("invalid slack signature", { status: 401 });
     }
 
-    // Slack sends interactive payloads as application/x-www-form-urlencoded
-    // with the JSON payload in a `payload` form field. Standard quirk.
     const params = new URLSearchParams(body);
     const payloadStr = params.get("payload");
     if (!payloadStr) {
       return new Response("missing payload", { status: 400 });
     }
 
-    let payload: SlackInteractionPayload;
+    let interaction: SlackInteractionPayload;
     try {
-      payload = JSON.parse(payloadStr) as SlackInteractionPayload;
+      interaction = JSON.parse(payloadStr) as SlackInteractionPayload;
     } catch {
       return new Response("payload not valid json", { status: 400 });
     }
 
-    if (payload.type !== "block_actions" || !payload.actions?.length) {
-      // URL verification or non-button interaction — acknowledge but
-      // don't process.
+    if (interaction.type !== "block_actions" || !interaction.actions?.length) {
       return new Response("", { status: 200 });
     }
 
-    const action = payload.actions[0];
+    const action = interaction.actions[0];
     const value = action.value || "";
-    const parts = value.split(":");
-    if (parts.length < 3) {
-      await replyInThread(payload, `:warning: Malformed button value: \`${value}\``);
+    const username = interaction.user?.username || interaction.user?.name || "someone";
+
+    // Slack requires a 200 within 3s. Heavy work goes into waitUntil so
+    // we respond fast and the Metricool POSTs run in the background.
+    if (value === "reject") {
+      ctx.waitUntil(replyInThread(
+        interaction,
+        `:no_entry_sign: *Skipped by @${username}* — nothing posted to Metricool.`,
+      ));
       return new Response("", { status: 200 });
     }
-    const [actionType, igPostId, xPostId] = parts;
-    const username = payload.user?.username || payload.user?.name || "someone";
 
-    let result: string;
-    try {
-      if (actionType === "approve") {
-        const ig = await publishPost(igPostId, env);
-        const x = xPostId && xPostId !== "none"
-          ? await publishPost(xPostId, env).catch((e: Error) => `X publish failed: ${e.message}`)
-          : null;
-        result =
-          `:white_check_mark: *Approved by @${username}* — ` +
-          `IG ${ig ? "✓" : "✗"}${x === null ? "" : x === true ? " · X ✓" : ` · ${x}`}`;
-      } else if (actionType === "reject") {
-        const ig = await deletePost(igPostId, env);
-        const x = xPostId && xPostId !== "none"
-          ? await deletePost(xPostId, env).catch((e: Error) => `X delete failed: ${e.message}`)
-          : null;
-        result =
-          `:no_entry_sign: *Skipped by @${username}* — drafts deleted from Metricool ` +
-          `(IG ${ig ? "✓" : "✗"}${x === null ? "" : x === true ? " · X ✓" : ` · ${x}`}).`;
-      } else {
-        result = `:warning: Unknown action: \`${actionType}\``;
+    if (value.startsWith("approve:")) {
+      const encoded = value.slice("approve:".length);
+      let post: PostPayload;
+      try {
+        post = decodePayload(encoded);
+      } catch (e) {
+        const err = e as Error;
+        ctx.waitUntil(replyInThread(
+          interaction,
+          `:warning: Couldn't decode the post payload: \`${err.message}\``,
+        ));
+        return new Response("", { status: 200 });
       }
-    } catch (e) {
-      const err = e as Error;
-      result = `:rotating_light: Metricool API failure: \`${err.message}\``;
+      ctx.waitUntil(handleApprove(interaction, username, post, env));
+      return new Response("", { status: 200 });
     }
 
-    // Send confirmation back via response_url (Slack lets us reply
-    // out-of-band for up to 30 min after the interaction).
-    await replyInThread(payload, result);
+    ctx.waitUntil(replyInThread(
+      interaction,
+      `:warning: Unknown button value: \`${value.slice(0, 80)}\``,
+    ));
     return new Response("", { status: 200 });
   },
 };
 
 // --------------------------------------------------------------------- //
-// Metricool helpers — direct fetch calls so we don't bundle an SDK.
+// Approve handler — POSTs to Metricool, posts a reply summarizing.
 // --------------------------------------------------------------------- //
 
-function metricoolUrl(postId: string, env: Env): string {
-  const u = new URL(`${METRICOOL_BASE}/v2/scheduler/posts/${postId}`);
+async function handleApprove(
+  interaction: SlackInteractionPayload,
+  username: string,
+  post: PostPayload,
+  env: Env,
+): Promise<void> {
+  const tz = post.timezone || DEFAULT_TIMEZONE;
+  const results: string[] = [];
+
+  // IG first. Fatal if it fails — IG is the headline.
+  try {
+    await createInstagramPost(post.image_url, post.ig.caption, post.ig.publish, tz, env);
+    results.push("IG ✓");
+  } catch (e) {
+    const err = e as Error;
+    results.push(`IG ✗ (${err.message.slice(0, 200)})`);
+  }
+
+  // X cross-post — non-fatal.
+  if (post.x) {
+    try {
+      await createXPost(post.image_url, post.x.caption, post.x.publish, tz, env);
+      results.push("X ✓");
+    } catch (e) {
+      const err = e as Error;
+      results.push(`X ✗ (${err.message.slice(0, 200)})`);
+    }
+  }
+
+  const summary = results.join(" · ");
+  await replyInThread(
+    interaction,
+    `:white_check_mark: *Approved by @${username}* — ${summary}`,
+  );
+}
+
+// --------------------------------------------------------------------- //
+// Metricool POST helpers — direct fetches, no SDK.
+// --------------------------------------------------------------------- //
+
+function metricoolPostUrl(env: Env): string {
+  const u = new URL(`${METRICOOL_BASE}/v2/scheduler/posts`);
   u.searchParams.set("blogId", env.METRICOOL_BLOG_ID);
   u.searchParams.set("userId", env.METRICOOL_USER_ID);
   u.searchParams.set("integrationSource", "MCP");
   return u.toString();
 }
 
-/**
- * Flip a Metricool draft post to publish-at-its-scheduled-time.
- *
- * Metricool's PUT /v2/scheduler/posts/{id} is annoyingly picky:
- *   1. It validates the FULL post body — partial updates with just
- *      `{autoPublish: true}` get 400 ("update.arg3.text must not be null").
- *   2. The GET response includes server-managed fields that PUT can't
- *      deserialize back: each provider has `status` + `detailedStatus`
- *      enums that Jackson refuses to re-parse from their string form
- *      ("Cannot construct instance of PublicationStatusCode").
- *   3. Network-specific data blocks (instagramData, twitterData, etc.)
- *      have their OWN nested `autoPublish` flag that needs flipping too.
- *
- * So this is GET → sanitize → flip flags → PUT. Discovered all three
- * the hard way on 2026-05-14.
- */
-async function publishPost(postId: string, env: Env): Promise<true> {
-  const url = metricoolUrl(postId, env);
+async function createInstagramPost(
+  imageUrl: string,
+  caption: string,
+  publishIso: string,
+  timezone: string,
+  env: Env,
+): Promise<void> {
+  const body = {
+    text: caption,
+    media: [imageUrl],
+    mediaAltText: [],
+    providers: [{ network: "instagram" }],
+    publicationDate: { dateTime: publishIso, timezone },
+    autoPublish: true,
+    draft: false,
+    firstCommentText: "",
+    hasNotReadNotes: false,
+    shortener: false,
+    smartLinkData: { ids: [] },
+    descendants: [],
+    instagramData: { type: "POST" },
+  };
+  await metricoolPost(body, env);
+}
 
-  // 1) GET current post. Single-post GET wraps in {"data": {...}}.
-  const getResp = await fetch(url, {
-    method: "GET",
-    headers: {
-      "X-Mc-Auth": env.METRICOOL_USER_TOKEN,
-      "Accept": "application/json",
-    },
-  });
-  if (!getResp.ok) {
-    const text = await getResp.text();
-    throw new Error(`GET ${postId} -> HTTP ${getResp.status}: ${text.slice(0, 300)}`);
-  }
-  const raw = (await getResp.json()) as Record<string, unknown>;
-  const post: Record<string, unknown> =
-    raw && typeof raw === "object" && "data" in raw && typeof raw.data === "object"
-      ? (raw.data as Record<string, unknown>)
-      : raw;
+async function createXPost(
+  imageUrl: string,
+  caption: string,
+  publishIso: string,
+  timezone: string,
+  env: Env,
+): Promise<void> {
+  const body = {
+    text: caption,
+    media: [imageUrl],
+    mediaAltText: [],
+    providers: [{ network: "twitter" }],
+    publicationDate: { dateTime: publishIso, timezone },
+    autoPublish: true,
+    draft: false,
+    firstCommentText: "",
+    hasNotReadNotes: false,
+    shortener: false,
+    smartLinkData: { ids: [] },
+    descendants: [],
+    twitterData: { type: "POST" },
+  };
+  await metricoolPost(body, env);
+}
 
-  if (!post || typeof post !== "object") {
-    throw new Error(`GET ${postId} returned unexpected shape: ${JSON.stringify(raw).slice(0, 300)}`);
-  }
-
-  // 2) Sanitize + flip flags
-  const updated = sanitizeForPut(post);
-  updated.autoPublish = true;
-  updated.draft = false;
-  // Flip the nested autoPublish ONLY on network-specific data blocks
-  // that ALREADY had that key in the GET response. Adding the field to
-  // blocks that don't recognize it (e.g. twitterData) causes Metricool's
-  // deserializer to bail with "Unrecognized field autoPublish, not
-  // marked as ignorable". Currently only instagramData has it, but we
-  // probe all four in case Metricool adds it to others later.
-  for (const dataKey of ["instagramData", "twitterData", "facebookData", "threadsData"]) {
-    const block = updated[dataKey];
-    if (block && typeof block === "object") {
-      const blockObj = block as Record<string, unknown>;
-      if ("autoPublish" in blockObj) {
-        updated[dataKey] = { ...blockObj, autoPublish: true };
-      }
-    }
-  }
-
-  // 3) PUT the full body back.
-  const putResp = await fetch(url, {
-    method: "PUT",
+async function metricoolPost(body: Record<string, unknown>, env: Env): Promise<void> {
+  const resp = await fetch(metricoolPostUrl(env), {
+    method: "POST",
     headers: {
       "X-Mc-Auth": env.METRICOOL_USER_TOKEN,
       "Content-Type": "application/json",
       "Accept": "application/json",
     },
-    body: JSON.stringify(updated),
-  });
-  if (!putResp.ok) {
-    const text = await putResp.text();
-    throw new Error(`PUT ${postId} -> HTTP ${putResp.status}: ${text.slice(0, 300)}`);
-  }
-  return true;
-}
-
-/**
- * Strip server-managed fields from a Metricool post body before PUT.
- * Without this Metricool's Jackson deserializer rejects the body with
- * various "no String-argument constructor" errors on read-only enums.
- */
-function sanitizeForPut(post: Record<string, unknown>): Record<string, unknown> {
-  const TOP_LEVEL_STRIP = new Set([
-    "id", "uuid", "creationDate", "creatorUserMail", "creatorUserId",
-  ]);
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(post)) {
-    if (TOP_LEVEL_STRIP.has(k)) continue;
-    if (k === "providers" && Array.isArray(v)) {
-      // Drop status + detailedStatus from each provider — they're
-      // read-only enums Metricool can't deserialize on PUT.
-      out[k] = v.map((p) => {
-        if (p && typeof p === "object") {
-          const provider = p as Record<string, unknown>;
-          const cleaned: Record<string, unknown> = {};
-          for (const [pk, pv] of Object.entries(provider)) {
-            if (pk === "status" || pk === "detailedStatus") continue;
-            cleaned[pk] = pv;
-          }
-          return cleaned;
-        }
-        return p;
-      });
-      continue;
-    }
-    out[k] = v;
-  }
-  return out;
-}
-
-async function deletePost(postId: string, env: Env): Promise<true> {
-  const resp = await fetch(metricoolUrl(postId, env), {
-    method: "DELETE",
-    headers: {
-      "X-Mc-Auth": env.METRICOOL_USER_TOKEN,
-      "Accept": "application/json",
-    },
+    body: JSON.stringify(body),
   });
   if (!resp.ok) {
     const text = await resp.text();
-    throw new Error(`DELETE ${postId} → HTTP ${resp.status}: ${text.slice(0, 300)}`);
+    throw new Error(`POST -> HTTP ${resp.status}: ${text.slice(0, 300)}`);
   }
-  return true;
 }
 
 // --------------------------------------------------------------------- //
-// Slack reply via response_url (no token needed — Slack signs the URL
-// itself).
+// Payload encoding — main.py base64-encodes a JSON object into the
+// Approve button's value. We base64-decode and JSON.parse on this side.
+// --------------------------------------------------------------------- //
+
+function decodePayload(encoded: string): PostPayload {
+  // base64.urlsafe_b64encode uses "-_" instead of "+/". Convert back so
+  // atob() (which expects standard base64) accepts it.
+  const standard = encoded.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = standard + "=".repeat((4 - (standard.length % 4)) % 4);
+  const jsonStr = decodeBase64Utf8(padded);
+  const parsed = JSON.parse(jsonStr) as PostPayload;
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("payload is not an object");
+  }
+  if (!parsed.image_url || !parsed.ig?.caption || !parsed.ig?.publish) {
+    throw new Error("payload missing required fields");
+  }
+  return parsed;
+}
+
+/**
+ * atob returns Latin-1 bytes — we need UTF-8 for emoji-bearing captions.
+ * Decode atob bytes through TextDecoder to get proper UTF-8 strings.
+ */
+function decodeBase64Utf8(b64: string): string {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+// --------------------------------------------------------------------- //
+// Slack reply via response_url.
 // --------------------------------------------------------------------- //
 
 async function replyInThread(
@@ -274,21 +289,23 @@ async function replyInThread(
   text: string,
 ): Promise<void> {
   if (!payload.response_url) return;
-  await fetch(payload.response_url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      replace_original: false,
-      thread_ts: payload.message?.ts,
-      text,
-    }),
-  }).catch(() => {
-    /* swallow; we already returned to Slack's main handler */
-  });
+  try {
+    await fetch(payload.response_url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        replace_original: false,
+        thread_ts: payload.message?.ts,
+        text,
+      }),
+    });
+  } catch {
+    /* swallow — we already returned 200 to Slack's main handler */
+  }
 }
 
 // --------------------------------------------------------------------- //
-// HMAC + constant-time string comparison (Cloudflare Workers' Web Crypto)
+// HMAC + constant-time compare.
 // --------------------------------------------------------------------- //
 
 async function hmacSha256Hex(secret: string, message: string): Promise<string> {
