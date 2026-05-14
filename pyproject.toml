@@ -13,6 +13,15 @@ dependencies = [
     # Required for zoneinfo.ZoneInfo on Windows (no system IANA tz database).
     # Linux runners ship tzdata in /usr/share/zoneinfo; pip install is harmless.
     "tzdata>=2024.1",
+    # Background removal for the New Chase renderer. Uses a U²-Net model
+    # (~180MB download on first run, cached locally + in GitHub Actions
+    # workflow cache for subsequent runs). CPU-only inference; one card
+    # image takes ~2-5s on a modest machine. If quality is ever
+    # insufficient we can swap to remove.bg API (paid, ~$0.20/image).
+    "rembg>=2.0.50",
+    # rembg pulls onnxruntime transitively; pin to a stable major to
+    # avoid surprise breakage when rembg jumps to a new ORT.
+    "onnxruntime>=1.16,<2.0",
 ]
 
 [dependency-groups]

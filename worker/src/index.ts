@@ -225,7 +225,23 @@ async function handleApprove(
   }
 
   const summary = results.join(" · ");
-  const statusText = `:white_check_mark: *Approved by @${username}* — ${summary}`;
+
+  // Include direct Metricool-dashboard links to each scheduled post so
+  // the marketing team can click in and edit caption/timing/etc.
+  // without hunting through the calendar. URL format is a best guess
+  // (matches Metricool's API path convention); easy to swap if the
+  // actual web app uses a different path.
+  const linkParts: string[] = [];
+  if (igPostId) {
+    linkParts.push(`<${metricoolDashboardUrl(igPostId, env)}|IG>`);
+  }
+  if (xPostId) {
+    linkParts.push(`<${metricoolDashboardUrl(xPostId, env)}|X>`);
+  }
+  const linksLine = linkParts.length
+    ? `\n:link: Edit on Metricool: ${linkParts.join(" · ")}`
+    : "";
+  const statusText = `:white_check_mark: *Approved by @${username}* — ${summary}${linksLine}`;
 
   // If we got at least one post ID back, attach a 🗑 Delete button so
   // the user can change their mind. Encodes both IDs (or "none" for X)
@@ -245,6 +261,22 @@ async function handleApprove(
     // Both failed; no Metricool state to delete. Plain status, no button.
     await replaceOriginal(interaction, statusText);
   }
+}
+
+/**
+ * Build a clickable link to the Metricool dashboard page for a
+ * specific scheduled post. Used to surface edit links in the Slack
+ * approval reply so marketing can tweak captions/timing in-place.
+ *
+ * The path format mirrors the Metricool REST API's
+ * /api/v2/scheduler/posts/{id} convention; the web app uses the
+ * same /scheduler/posts/{id} structure. If you click a link and get
+ * a 404, drop a note and I'll swap the path — easy fix.
+ */
+function metricoolDashboardUrl(postId: string, env: Env): string {
+  const u = new URL(`https://app.metricool.com/scheduler/posts/${postId}`);
+  u.searchParams.set("blogId", env.METRICOOL_BLOG_ID);
+  return u.toString();
 }
 
 async function handleDelete(
