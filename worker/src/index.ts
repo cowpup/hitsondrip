@@ -139,23 +139,62 @@ function metricoolUrl(postId: string, env: Env): string {
 
 /**
  * Flip a Metricool draft post to publish-at-its-scheduled-time.
- * The post was created by main.py with autoPublish=false; we set it
- * to true so Metricool releases it at the originally-scheduled time
- * (6pm PT for IG, 6:15pm PT for X).
+ *
+ * Metricool's PUT /v2/scheduler/posts/{id} validates the FULL post body —
+ * partial updates with just `{autoPublish: true}` get rejected with a 400
+ * ("update.arg3.text must not be null", etc.). So we GET the current post,
+ * mutate the flags we care about, then PUT it back whole.
+ *
+ * (Discovered the hard way on 2026-05-14 when an approve click came back
+ * with a 400 in Slack. The partial-PUT may also have a side effect of
+ * persisting partial fields anyway — doing the full GET-then-PUT
+ * sidesteps that ambiguity.)
  */
 async function publishPost(postId: string, env: Env): Promise<true> {
-  const resp = await fetch(metricoolUrl(postId, env), {
+  const url = metricoolUrl(postId, env);
+
+  // 1) GET current post. Single-post GET wraps in {"data": {...}}.
+  const getResp = await fetch(url, {
+    method: "GET",
+    headers: {
+      "X-Mc-Auth": env.METRICOOL_USER_TOKEN,
+      "Accept": "application/json",
+    },
+  });
+  if (!getResp.ok) {
+    const text = await getResp.text();
+    throw new Error(`GET ${postId} -> HTTP ${getResp.status}: ${text.slice(0, 300)}`);
+  }
+  const raw = (await getResp.json()) as Record<string, unknown>;
+  const post: Record<string, unknown> =
+    raw && typeof raw === "object" && "data" in raw && typeof raw.data === "object"
+      ? (raw.data as Record<string, unknown>)
+      : raw;
+
+  if (!post || typeof post !== "object") {
+    throw new Error(`GET ${postId} returned unexpected shape: ${JSON.stringify(raw).slice(0, 300)}`);
+  }
+
+  // 2) Flip the flags. Keep every other field intact.
+  const updated: Record<string, unknown> = {
+    ...post,
+    autoPublish: true,
+    draft: false,
+  };
+
+  // 3) PUT the full body back.
+  const putResp = await fetch(url, {
     method: "PUT",
     headers: {
       "X-Mc-Auth": env.METRICOOL_USER_TOKEN,
       "Content-Type": "application/json",
       "Accept": "application/json",
     },
-    body: JSON.stringify({ autoPublish: true, draft: false }),
+    body: JSON.stringify(updated),
   });
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`PUT ${postId} → HTTP ${resp.status}: ${text.slice(0, 300)}`);
+  if (!putResp.ok) {
+    const text = await putResp.text();
+    throw new Error(`PUT ${postId} -> HTTP ${putResp.status}: ${text.slice(0, 300)}`);
   }
   return true;
 }
