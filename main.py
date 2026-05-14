@@ -298,16 +298,24 @@ def run() -> int:
         _emit_failure_to_slack("Image host upload failed", e)
         return 1
 
-    # Schedule on Metricool
+    # Schedule on Metricool. blog_id comes from METRICOOL_BLOG_ID env var
+    # (set per the briefing as 1909358 = Drip TCG brand). Calling
+    # find_instagram_brand() would also work but adds an extra Metricool
+    # API call to discover an ID we already know.
     try:
         publish_iso, publish_tz = schedule_time.next_6pm_pt()
         from datetime import datetime as _dt
         publish_dt = _dt.fromisoformat(publish_iso)
 
-        brand = metricool.find_instagram_brand()  # defaults to "drip tcg"
+        blog_id_raw = os.environ.get("METRICOOL_BLOG_ID")
+        if not blog_id_raw:
+            raise MetricoolError(
+                "METRICOOL_BLOG_ID not set — required for schedule_instagram_post"
+            )
+        blog_id = int(blog_id_raw)
         caption = build_caption(hit)
         mc_response = metricool.schedule_instagram_post(
-            blog_id=brand["blog_id"],
+            blog_id=blog_id,
             caption=caption,
             media_url=image_url,
             publish_at=publish_dt,
