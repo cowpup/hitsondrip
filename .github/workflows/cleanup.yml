@@ -1,0 +1,51 @@
+# Daily fail-closed cleanup — runs at 5:55pm PT and deletes any
+# unapproved drafts left over from main.py's 12pm-PT run.
+#
+# Why a separate workflow:
+#   daily.yml at 12pm posts to Slack with Approve/Skip buttons. If the
+#   user clicks neither, the Metricool drafts would sit indefinitely.
+#   This workflow's job is to clear them out at the last moment before
+#   the 6pm PT publish window so nothing stale gets published tomorrow
+#   or sits clogging Metricool's queue.
+#
+# UTC scheduling note:
+#   "55 0 * * *" fires at:
+#     - 5:55pm PDT (UTC-7, summer)
+#     - 4:55pm PST (UTC-8, winter)
+#   Both are before the 6pm PT publish, which is the only thing that
+#   matters. Earlier-firing in winter is fine — just shortens the
+#   approval window from ~6h to ~5h.
+
+name: cleanup
+
+on:
+  schedule:
+    - cron: "55 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cleanup
+  cancel-in-progress: true
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv python install 3.13
+      - run: uv sync --frozen --no-install-project || uv sync
+      - name: Run cleanup.py
+        env:
+          METRICOOL_USER_TOKEN: ${{ secrets.METRICOOL_USER_TOKEN }}
+          METRICOOL_USER_ID:    ${{ secrets.METRICOOL_USER_ID }}
+          METRICOOL_BLOG_ID:    ${{ secrets.METRICOOL_BLOG_ID }}
+          SLACK_BOT_TOKEN:      ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID:     ${{ secrets.SLACK_CHANNEL_ID }}
+        run: uv run python -u cleanup.py

@@ -368,6 +368,66 @@ def schedule_x_post(
 
 
 # --------------------------------------------------------------------------- #
+# List / delete scheduled posts — used by cleanup.py at 5:55pm PT to delete
+# any unapproved drafts (fail-closed behavior per the approval workflow).
+# --------------------------------------------------------------------------- #
+
+
+def list_scheduled_posts(
+    blog_id: int,
+    *,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+) -> list[dict[str, Any]]:
+    """Return scheduled (and possibly draft) posts for a brand.
+
+    The Metricool API accepts optional `start` / `end` query params to
+    constrain the window. When omitted, returns the default window (the
+    upcoming scheduled posts as configured by the dashboard).
+
+    Args:
+        blog_id: Metricool blog ID.
+        start: Optional inclusive lower bound (naive PT datetime).
+        end: Optional inclusive upper bound (naive PT datetime).
+
+    Returns the list of posts. Each post dict typically has at minimum:
+        id (uuid or int), text, publicationDate (with dateTime + timezone),
+        autoPublish, draft, providers, status. Field names can drift —
+        cleanup.py filters defensively.
+    """
+    params: dict[str, Any] = {"blogId": blog_id}
+    if start is not None:
+        params["start"] = start.strftime("%Y-%m-%dT%H:%M:%S")
+    if end is not None:
+        params["end"] = end.strftime("%Y-%m-%dT%H:%M:%S")
+    response = _request("GET", "/v2/scheduler/posts", params=params)
+    if isinstance(response, list):
+        return response
+    if isinstance(response, dict):
+        for key in ("data", "posts", "items"):
+            if key in response and isinstance(response[key], list):
+                return response[key]
+    raise MetricoolError(
+        f"Unexpected /v2/scheduler/posts response shape: "
+        f"{type(response).__name__} — {str(response)[:300]}"
+    )
+
+
+def delete_scheduled_post(post_id: str, blog_id: int) -> None:
+    """Delete a scheduled post by ID.
+
+    Raises MetricoolError on auth / HTTP failure. Idempotent-ish — a 404
+    on an already-deleted post will surface as a MetricoolError; callers
+    can swallow that specifically if they're polling for cleanup.
+    """
+    _request(
+        "DELETE",
+        f"/v2/scheduler/posts/{post_id}",
+        params={"blogId": blog_id},
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Image URL snapshot
 # --------------------------------------------------------------------------- #
 

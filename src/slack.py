@@ -29,6 +29,7 @@ def post_message(
     *,
     channel_id: Optional[str] = None,
     token: Optional[str] = None,
+    actions: Optional[list[dict[str, Any]]] = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Post a message to a Slack channel.
@@ -38,13 +39,18 @@ def post_message(
             Also used as the fallback for notifications and clients without block support.
         image_url: Optional public image URL. If given, rendered as an image block
             beneath the text. Slack's servers fetch the image, so the URL must be
-            reachable from the public internet (a Canva presigned export URL is fine).
+            reachable from the public internet.
         channel_id: Slack channel ID. Defaults to SLACK_CHANNEL_ID env var.
         token: Bot token. Defaults to SLACK_BOT_TOKEN env var.
+        actions: Optional list of Slack `button`/`select` element dicts. When
+            provided, appended as an `actions` block at the bottom of the
+            message. Used by main.py for the approval buttons.
+            See https://api.slack.com/reference/block-kit/block-elements
         timeout: HTTP timeout in seconds.
 
     Returns:
-        The decoded JSON response from Slack.
+        The decoded JSON response from Slack (includes the posted `ts`,
+        which can be used as a thread anchor for follow-up messages).
 
     Raises:
         SlackError: On missing config, HTTP failure, or `ok: false` response.
@@ -71,6 +77,8 @@ def post_message(
                 "alt_text": "Just Pulled — daily Drip post",
             }
         )
+    if actions:
+        blocks.append({"type": "actions", "elements": actions})
 
     payload = {
         "channel": channel,
