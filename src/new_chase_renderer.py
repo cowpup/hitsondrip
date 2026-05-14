@@ -145,6 +145,42 @@ PACK_NAME_MAX_FONT_DU = 39
 HIT_VALUE_EXTRA_LEFT_SHIFT_DU = 15
 
 # --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+
+def _trim_alpha_padding(img: Image.Image) -> Image.Image:
+    """Crop an RGBA image to its non-transparent bounding box.
+
+    Some pack uploads on DripShopLive ship as a padded canvas (e.g.
+    1920×1080 stream-frame template) with the actual content in the
+    center and full transparency around it. fit-centering such an
+    image preserves the empty-canvas aspect ratio, producing a tiny
+    visible pack inside our layout bbox. Cropping to the alpha bbox
+    first makes the renderer agnostic to source-canvas padding.
+
+    No-op for:
+      - non-RGBA images (RGB has no alpha channel to inspect)
+      - fully-opaque RGBA (alpha covers the full canvas, no padding)
+      - fully-transparent images (defensive — returns input unchanged
+        rather than throwing, so a bad upload doesn't crash the run)
+
+    Returns a NEW image when cropping is needed, otherwise returns the
+    input unchanged.
+    """
+    if img.mode != "RGBA":
+        return img
+    alpha = img.split()[3]
+    content_bbox = alpha.getbbox()
+    if content_bbox is None:
+        return img  # fully transparent, nothing to crop to
+    iw, ih = img.size
+    if content_bbox == (0, 0, iw, ih):
+        return img  # alpha already fills the canvas
+    return img.crop(content_bbox)
+
+
+# --------------------------------------------------------------------------- #
 # Debug overlay
 # --------------------------------------------------------------------------- #
 
@@ -237,7 +273,17 @@ def render_new_chase(
     scale = bg_h / DESIGN_HEIGHT
 
     # 1) Pack image — composited first (renders BEHIND everything else).
-    pack_src = _download_image(pack_image_url)
+    # Trim transparent padding before fit-centering: pack images
+    # uploaded via Drip's admin panel sometimes ship as a 1920×1080
+    # stream-frame canvas with the actual pack in the center and the
+    # rest transparent (e.g. Collector's Jam Silver — content fills
+    # only 24% × 66% of the canvas). Without this trim, fit-centered
+    # preserves the empty-canvas aspect ratio and the visible pack
+    # lands at ~1/4 the expected size inside our bbox. Discovered
+    # 2026-05-14 after the JSONB-lookup test surfaced a tiny pack
+    # render. _trim_alpha_padding is a no-op for full-bleed images
+    # (the marketplace fallback at 1080×1080 fills 100%, unchanged).
+    pack_src = _trim_alpha_padding(_download_image(pack_image_url))
     pack_bbox_px = _bbox_du_to_px(PACK_IMAGE_BBOX_DU, scale)
     pack_size_px = _bbox_size(pack_bbox_px)
     pack_layer = _fit_centered(pack_src, pack_size_px)
