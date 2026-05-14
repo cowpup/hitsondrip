@@ -1,6 +1,7 @@
 {
-  "_comment": "Featured pack metadata for the New Chase daily post. Update when the featured pack rotates. pack_price is used at runtime to derive the chase-threshold filter (card.price >= 10 * pack_price) substituted into queries/new_chase.sql at the :threshold placeholder. pack_image_url should be the BARE pack render (transparent PNG, no marketing text baked in) hosted on cdn.dripshop.live/product/. pack_name is rendered as-is by src/new_chase_renderer (string_transforms.pack_name_for_canva uppercases + Pokemon-strips it).",
+  "_comment": "Featured pack metadata for the New Chase daily post. Update when the featured pack rotates. pack_price + chase_threshold_multiplier together derive the chase filter (card.price >= pack_price * multiplier) substituted into queries/new_chase.sql at the :threshold placeholder. pack_image_url should be the BARE pack render (transparent PNG, no marketing text baked in) hosted on cdn.dripshop.live/product/. pack_name is rendered as-is by src/new_chase_renderer (string_transforms.pack_name_for_canva uppercases + Pokemon-strips it). chase_threshold_multiplier defaults to 10 if omitted; lower it (5, 3) to be more lenient when chase prices in inventory routinely run below 10x the pack price.",
   "pack_name": "GOLD PSA 10 SLAB PACK",
   "pack_price": 100,
-  "pack_image_url": "https://cdn.dripshop.live/product/_tpbM51S6K806mAwwCV5E.png"
+  "pack_image_url": "https://cdn.dripshop.live/product/_tpbM51S6K806mAwwCV5E.png",
+  "chase_threshold_multiplier": 10
 }

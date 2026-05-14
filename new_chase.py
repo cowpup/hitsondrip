@@ -92,11 +92,13 @@ CHASE_IMAGE_FILENAME = "latest_chase.png"
 # MAX(created_at) and would happily repost an old batch otherwise.
 DEFAULT_MAX_BATCH_AGE_HOURS = 36
 
-# Chase threshold multiplier. card.price >= MULTIPLIER * pack.price.
-# Lives here (not in the config file) because it's a product-design
-# constant, not a per-run knob. If we ever want to tune per-run, the
-# right move is to add it to config/featured_pack.json — not env.
-CHASE_THRESHOLD_MULTIPLIER = 10
+# Chase threshold multiplier — DEFAULT only. The real value comes from
+# config/featured_pack.json's `chase_threshold_multiplier` key (added
+# 2026-05-14 after the first GH Actions run revealed the 10× rule was
+# too strict for current inventory shape — top of latest batch was a
+# $474 chase at only 4.7× the $100 pack price). Tuning via config means
+# Noah can drop to 5× or 3× without touching code.
+DEFAULT_CHASE_THRESHOLD_MULTIPLIER = 10
 
 
 # --------------------------------------------------------------------------- #
@@ -108,8 +110,9 @@ def load_featured_pack() -> dict[str, Any]:
     """Load and validate config/featured_pack.json.
 
     Returns a dict with keys: pack_name (str), pack_price (number),
-    pack_image_url (str). Raises RuntimeError if the file is missing
-    or any required key is absent / wrong type.
+    pack_image_url (str), chase_threshold_multiplier (number, default
+    DEFAULT_CHASE_THRESHOLD_MULTIPLIER if absent). Raises RuntimeError
+    if the file is missing or any required key is absent / wrong type.
     """
     if not CONFIG_PATH.exists():
         raise RuntimeError(
@@ -128,6 +131,14 @@ def load_featured_pack() -> dict[str, Any]:
             )
     if raw["pack_price"] <= 0:
         raise RuntimeError(f"{CONFIG_PATH} pack_price must be > 0")
+    # Optional multiplier — default to 10 for backward compatibility.
+    mult = raw.get("chase_threshold_multiplier", DEFAULT_CHASE_THRESHOLD_MULTIPLIER)
+    if not isinstance(mult, (int, float)) or mult <= 0:
+        raise RuntimeError(
+            f"{CONFIG_PATH} chase_threshold_multiplier must be a positive "
+            f"number, got {mult!r}"
+        )
+    raw["chase_threshold_multiplier"] = mult
     return raw
 
 
@@ -246,7 +257,7 @@ def fetch_chase_candidate(threshold: float) -> list[dict[str, Any]]:
     Substitution is plain string-replace (Postgres doesn't natively
     support `:name` placeholders without going through a driver, but
     the model+MCP path uses raw SQL). `threshold` comes from
-    `CHASE_THRESHOLD_MULTIPLIER * featured_pack.pack_price` where
+    `featured_pack.chase_threshold_multiplier * featured_pack.pack_price` where
     pack_price is a numeric value from a config file Noah controls,
     so injection risk is nil.
 
@@ -442,11 +453,12 @@ def _slack_no_qualifying(
     near_miss: Optional[dict[str, Any]],
 ) -> None:
     """Skip message: batch is fresh but nothing cleared the threshold.
-    Includes near-miss info so Noah can tune pack_price downward."""
+    Includes near-miss info so Noah can tune pack_price or
+    chase_threshold_multiplier downward."""
     base = (
         f":no_entry_sign: *Skipping New Chase post — no qualifying chase.*\n"
         f"Threshold: card.price ≥ *${int(threshold)}* "
-        f"({CHASE_THRESHOLD_MULTIPLIER}× the ${pack['pack_price']} "
+        f"({pack['chase_threshold_multiplier']}× the ${pack['pack_price']} "
         f"featured pack price)."
     )
     if near_miss is None:
@@ -489,11 +501,12 @@ def run() -> int:
         _emit_failure_to_slack("Load featured-pack config failed", e)
         return 1
     log.info(
-        "Featured pack: %r @ $%s — %s",
-        pack["pack_name"], pack["pack_price"], pack["pack_image_url"],
+        "Featured pack: %r @ $%s (multiplier=%s×) — %s",
+        pack["pack_name"], pack["pack_price"],
+        pack["chase_threshold_multiplier"], pack["pack_image_url"],
     )
 
-    threshold = CHASE_THRESHOLD_MULTIPLIER * float(pack["pack_price"])
+    threshold = float(pack["chase_threshold_multiplier"]) * float(pack["pack_price"])
     max_batch_age_hours = int(
         os.environ.get("MAX_BATCH_AGE_HOURS", DEFAULT_MAX_BATCH_AGE_HOURS)
     )
@@ -531,9 +544,9 @@ def run() -> int:
 
     if not candidates:
         log.info(
-            "No card cleared $%.0f threshold (%dx the $%s pack price); "
+            "No card cleared $%.0f threshold (%sx the $%s pack price); "
             "fetching near-miss for the skip message.",
-            threshold, CHASE_THRESHOLD_MULTIPLIER, pack["pack_price"],
+            threshold, pack["chase_threshold_multiplier"], pack["pack_price"],
         )
         try:
             near_miss = fetch_near_miss()

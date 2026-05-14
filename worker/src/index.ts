@@ -48,7 +48,22 @@ export interface Env {
 }
 
 const GITHUB_REPO = "cowpup/hitsondrip";
-const GITHUB_WORKFLOW = "daily.yml";
+
+/**
+ * Slash-command → GitHub Actions workflow file mapping. Adding a new
+ * automation = one line here. Slack App config registers the command
+ * name independently; this map drives what runs when the Worker
+ * receives the dispatch.
+ *
+ * Both workflows live on the same repo and use the same
+ * workflow_dispatch trigger, so the dispatch payload is identical
+ * except for the workflow file path. Approval flow is shared (both
+ * use the same Slack button payload format and Worker handlers).
+ */
+const SLASH_COMMAND_WORKFLOWS: Record<string, string> = {
+  "/justpulled": "daily.yml",
+  "/newchase":   "new_chase.yml",
+};
 
 const METRICOOL_BASE = "https://app.metricool.com/api";
 const DEFAULT_TIMEZONE = "America/Los_Angeles";
@@ -332,7 +347,8 @@ async function handleSlashCommand(
   const userName = params.get("user_name") || "someone";
   const responseUrl = params.get("response_url") || "";
 
-  if (command !== "/justpulled") {
+  const workflowFile = SLASH_COMMAND_WORKFLOWS[command];
+  if (!workflowFile) {
     return jsonResponse({
       response_type: "ephemeral",
       text: `:warning: Unknown command: \`${command}\``,
@@ -344,12 +360,12 @@ async function handleSlashCommand(
   // immediately. If dispatch fails, fall back to a delayed response
   // via response_url so the user sees the error.
   try {
-    await dispatchWorkflow(env);
+    await dispatchWorkflow(workflowFile, env);
     return jsonResponse({
       response_type: "in_channel",
       text:
-        `:rocket: *@${userName} triggered \`/justpulled\`* — ` +
-        `daily.yml is running now. Approval message will appear here in ~30 seconds.`,
+        `:rocket: *@${userName} triggered \`${command}\`* — ` +
+        `${workflowFile} is running now. Approval message will appear here in ~30 seconds.`,
     });
   } catch (e) {
     const err = e as Error;
@@ -374,11 +390,11 @@ async function handleSlashCommand(
   }
 }
 
-async function dispatchWorkflow(env: Env): Promise<void> {
+async function dispatchWorkflow(workflowFile: string, env: Env): Promise<void> {
   if (!env.GITHUB_PAT) {
     throw new Error("GITHUB_PAT not configured on the Worker.");
   }
-  const url = `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${GITHUB_WORKFLOW}/dispatches`;
+  const url = `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${workflowFile}/dispatches`;
   const resp = await fetch(url, {
     method: "POST",
     headers: {
