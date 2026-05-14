@@ -34,6 +34,10 @@ export interface Env {
   METRICOOL_USER_TOKEN: string;
   METRICOOL_USER_ID: string;
   METRICOOL_BLOG_ID: string;
+  /** GitHub fine-grained PAT with `actions: write` on cowpup/hitsondrip,
+   * used for the /justpulled slash command to trigger the daily.yml
+   * workflow_dispatch. Stored as a Worker secret. */
+  GITHUB_PAT: string;
   /**
    * KV namespace for click deduplication. Worker stores the Slack
    * message_ts as a key with 24h TTL on first click; subsequent clicks
@@ -42,6 +46,9 @@ export interface Env {
    */
   DEDUP: KVNamespace;
 }
+
+const GITHUB_REPO = "cowpup/hitsondrip";
+const GITHUB_WORKFLOW = "daily.yml";
 
 const METRICOOL_BASE = "https://app.metricool.com/api";
 const DEFAULT_TIMEZONE = "America/Los_Angeles";
@@ -82,9 +89,21 @@ export default {
     }
 
     const params = new URLSearchParams(body);
+
+    // Route by payload shape:
+    //   - Slack INTERACTIONS (button clicks) come with a `payload` form
+    //     field containing JSON.
+    //   - Slack SLASH COMMANDS (/justpulled etc.) come with `command`,
+    //     `text`, `user_name`, etc. as separate form fields (no `payload`).
     const payloadStr = params.get("payload");
+    const command = params.get("command");
+
+    if (command) {
+      return await handleSlashCommand(params, ctx, env);
+    }
+
     if (!payloadStr) {
-      return new Response("missing payload", { status: 400 });
+      return new Response("missing payload or command", { status: 400 });
     }
 
     let interaction: SlackInteractionPayload;
@@ -103,31 +122,21 @@ export default {
     const username = interaction.user?.username || interaction.user?.name || "someone";
     const messageTs = interaction.message?.ts;
 
-    // Click deduplication via KV. First click for a given message_ts
-    // sets the key; subsequent clicks see it set and bail out. The
-    // check-then-set isn't atomic across Cloudflare's edge — for a
-    // single-user-clicking-twice case in the same colo, KV reads after
-    // writes are typically consistent within milliseconds, so this
-    // catches the realistic race. (For stronger guarantees we'd need
-    // Durable Objects.)
-    if (messageTs) {
-      const dedupKey = `processed:${messageTs}`;
+    // Click deduplication via KV, SCOPED BY ACTION TYPE so an approve-dedup
+    // doesn't block a subsequent delete on the same message (and vice
+    // versa). The "approve" -> "delete" sequence is intentional after a
+    // user approves and changes their mind.
+    const actionType = actionTypeOf(value);
+    if (messageTs && actionType) {
+      const dedupKey = `processed:${actionType}:${messageTs}`;
       const existing = await env.DEDUP.get(dedupKey);
       if (existing) {
-        // Already actioned. No-op — also no Slack reply since the
-        // message has already been updated by the first click handler.
         return new Response("", { status: 200 });
       }
-      // Lock immediately. 24h TTL — well past the 5:55pm PT window the
-      // Slack message is relevant for. await ensures the put completes
-      // before we kick off any side-effecting work below.
       await env.DEDUP.put(dedupKey, "1", { expirationTtl: 60 * 60 * 24 });
     }
 
-    // Slack requires a 200 within 3s. Heavy work goes into waitUntil so
-    // we respond fast and the Metricool POSTs run in the background.
     if (value === "reject") {
-      // Replace original message — buttons disappear, status visible to channel.
       ctx.waitUntil(replaceOriginal(
         interaction,
         `:no_entry_sign: *Skipped by @${username}* — nothing posted to Metricool.`,
@@ -142,7 +151,6 @@ export default {
         post = decodePayload(encoded);
       } catch (e) {
         const err = e as Error;
-        // Leave buttons in place on decode failure so the user can hit Skip.
         ctx.waitUntil(replyInThread(
           interaction,
           `:warning: Couldn't decode the post payload: \`${err.message}\``,
@@ -150,6 +158,15 @@ export default {
         return new Response("", { status: 200 });
       }
       ctx.waitUntil(handleApprove(interaction, username, post, env));
+      return new Response("", { status: 200 });
+    }
+
+    if (value.startsWith("delete:")) {
+      // value = "delete:<igPostId>:<xPostId or 'none'>"
+      const parts = value.split(":");
+      const igId = parts[1] || "none";
+      const xId = parts[2] || "none";
+      ctx.waitUntil(handleDelete(interaction, username, igId, xId, env));
       return new Response("", { status: 200 });
     }
 
@@ -161,6 +178,14 @@ export default {
   },
 };
 
+/** "approve" | "reject" | "delete" | null based on the button's value prefix. */
+function actionTypeOf(value: string): string | null {
+  if (value === "reject") return "reject";
+  if (value.startsWith("approve:")) return "approve";
+  if (value.startsWith("delete:")) return "delete";
+  return null;
+}
+
 // --------------------------------------------------------------------- //
 // Approve handler — POSTs to Metricool, posts a reply summarizing.
 // --------------------------------------------------------------------- //
@@ -171,9 +196,6 @@ async function handleApprove(
   post: PostPayload,
   env: Env,
 ): Promise<void> {
-  // First thing: replace the original message to remove the buttons.
-  // This kills the UX-level re-click window within a few hundred ms,
-  // belt-and-suspenders with the KV dedup in the main handler.
   await replaceOriginal(
     interaction,
     `:hourglass_flowing_sand: *Processing approval by @${username}...*`,
@@ -181,20 +203,20 @@ async function handleApprove(
 
   const tz = post.timezone || DEFAULT_TIMEZONE;
   const results: string[] = [];
+  let igPostId: string | null = null;
+  let xPostId: string | null = null;
 
-  // IG first. Fatal if it fails — IG is the headline.
   try {
-    await createInstagramPost(post.image_url, post.ig.caption, post.ig.publish, tz, env);
+    igPostId = await createInstagramPost(post.image_url, post.ig.caption, post.ig.publish, tz, env);
     results.push("IG ✓");
   } catch (e) {
     const err = e as Error;
     results.push(`IG ✗ (${err.message.slice(0, 200)})`);
   }
 
-  // X cross-post — non-fatal.
   if (post.x) {
     try {
-      await createXPost(post.image_url, post.x.caption, post.x.publish, tz, env);
+      xPostId = await createXPost(post.image_url, post.x.caption, post.x.publish, tz, env);
       results.push("X ✓");
     } catch (e) {
       const err = e as Error;
@@ -202,20 +224,163 @@ async function handleApprove(
     }
   }
 
-  // Final update — replaces "Processing..." with the outcome.
   const summary = results.join(" · ");
+  const statusText = `:white_check_mark: *Approved by @${username}* — ${summary}`;
+
+  // If we got at least one post ID back, attach a 🗑 Delete button so
+  // the user can change their mind. Encodes both IDs (or "none" for X)
+  // into the button value, same pattern as the approve button.
+  if (igPostId || xPostId) {
+    await replaceOriginalWithButton(
+      interaction,
+      statusText,
+      {
+        action_id: "delete",
+        style: "danger",
+        text: "🗑 Delete post",
+        value: `delete:${igPostId || "none"}:${xPostId || "none"}`,
+      },
+    );
+  } else {
+    // Both failed; no Metricool state to delete. Plain status, no button.
+    await replaceOriginal(interaction, statusText);
+  }
+}
+
+async function handleDelete(
+  interaction: SlackInteractionPayload,
+  username: string,
+  igId: string,
+  xId: string,
+  env: Env,
+): Promise<void> {
   await replaceOriginal(
     interaction,
-    `:white_check_mark: *Approved by @${username}* — ${summary}`,
+    `:hourglass_flowing_sand: *Deleting posts by @${username}...*`,
   );
+
+  const results: string[] = [];
+
+  if (igId && igId !== "none") {
+    try {
+      await metricoolDelete(igId, env);
+      results.push("IG ✓");
+    } catch (e) {
+      const err = e as Error;
+      results.push(`IG ✗ (${err.message.slice(0, 200)})`);
+    }
+  }
+  if (xId && xId !== "none") {
+    try {
+      await metricoolDelete(xId, env);
+      results.push("X ✓");
+    } catch (e) {
+      const err = e as Error;
+      results.push(`X ✗ (${err.message.slice(0, 200)})`);
+    }
+  }
+
+  const summary = results.length ? results.join(" · ") : "nothing to delete";
+  await replaceOriginal(
+    interaction,
+    `:wastebasket: *Deleted by @${username}* — ${summary}`,
+  );
+}
+
+// --------------------------------------------------------------------- //
+// /justpulled slash command — dispatches the daily.yml workflow.
+// --------------------------------------------------------------------- //
+
+async function handleSlashCommand(
+  params: URLSearchParams,
+  ctx: ExecutionContext,
+  env: Env,
+): Promise<Response> {
+  const command = (params.get("command") || "").trim();
+  const userName = params.get("user_name") || "someone";
+  const responseUrl = params.get("response_url") || "";
+
+  if (command !== "/justpulled") {
+    return jsonResponse({
+      response_type: "ephemeral",
+      text: `:warning: Unknown command: \`${command}\``,
+    });
+  }
+
+  // Slack wants a response within 3s. We dispatch the workflow inline
+  // (GitHub's dispatch API typically returns in 200-500ms) and reply
+  // immediately. If dispatch fails, fall back to a delayed response
+  // via response_url so the user sees the error.
+  try {
+    await dispatchWorkflow(env);
+    return jsonResponse({
+      response_type: "in_channel",
+      text:
+        `:rocket: *@${userName} triggered \`/justpulled\`* — ` +
+        `daily.yml is running now. Approval message will appear here in ~30 seconds.`,
+    });
+  } catch (e) {
+    const err = e as Error;
+    // If we exceeded the 3s window or anything else, push to response_url
+    // so the user still sees the error.
+    if (responseUrl) {
+      ctx.waitUntil(
+        fetch(responseUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            response_type: "ephemeral",
+            text: `:rotating_light: Workflow dispatch failed: \`${err.message.slice(0, 300)}\``,
+          }),
+        }).catch(() => undefined),
+      );
+    }
+    return jsonResponse({
+      response_type: "ephemeral",
+      text: `:rotating_light: Workflow dispatch failed: \`${err.message.slice(0, 300)}\``,
+    });
+  }
+}
+
+async function dispatchWorkflow(env: Env): Promise<void> {
+  if (!env.GITHUB_PAT) {
+    throw new Error("GITHUB_PAT not configured on the Worker.");
+  }
+  const url = `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${GITHUB_WORKFLOW}/dispatches`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.GITHUB_PAT}`,
+      "Accept": "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      // GitHub requires a User-Agent on every API call. Workers don't
+      // send a default one, so set it explicitly.
+      "User-Agent": "hitsondrip-approver/1.0",
+    },
+    body: JSON.stringify({ ref: "main" }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`GitHub dispatches API -> HTTP ${resp.status}: ${text.slice(0, 300)}`);
+  }
+}
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 // --------------------------------------------------------------------- //
 // Metricool POST helpers — direct fetches, no SDK.
 // --------------------------------------------------------------------- //
 
-function metricoolPostUrl(env: Env): string {
-  const u = new URL(`${METRICOOL_BASE}/v2/scheduler/posts`);
+function metricoolPostsUrl(env: Env, postId?: string): string {
+  const path = postId
+    ? `/v2/scheduler/posts/${postId}`
+    : `/v2/scheduler/posts`;
+  const u = new URL(`${METRICOOL_BASE}${path}`);
   u.searchParams.set("blogId", env.METRICOOL_BLOG_ID);
   u.searchParams.set("userId", env.METRICOOL_USER_ID);
   u.searchParams.set("integrationSource", "MCP");
@@ -228,7 +393,7 @@ async function createInstagramPost(
   publishIso: string,
   timezone: string,
   env: Env,
-): Promise<void> {
+): Promise<string | null> {
   const body = {
     text: caption,
     media: [imageUrl],
@@ -244,7 +409,7 @@ async function createInstagramPost(
     descendants: [],
     instagramData: { type: "POST" },
   };
-  await metricoolPost(body, env);
+  return await metricoolPost(body, env);
 }
 
 async function createXPost(
@@ -253,7 +418,7 @@ async function createXPost(
   publishIso: string,
   timezone: string,
   env: Env,
-): Promise<void> {
+): Promise<string | null> {
   const body = {
     text: caption,
     media: [imageUrl],
@@ -269,11 +434,11 @@ async function createXPost(
     descendants: [],
     twitterData: { type: "POST" },
   };
-  await metricoolPost(body, env);
+  return await metricoolPost(body, env);
 }
 
-async function metricoolPost(body: Record<string, unknown>, env: Env): Promise<void> {
-  const resp = await fetch(metricoolPostUrl(env), {
+async function metricoolPost(body: Record<string, unknown>, env: Env): Promise<string | null> {
+  const resp = await fetch(metricoolPostsUrl(env), {
     method: "POST",
     headers: {
       "X-Mc-Auth": env.METRICOOL_USER_TOKEN,
@@ -285,6 +450,39 @@ async function metricoolPost(body: Record<string, unknown>, env: Env): Promise<v
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`POST -> HTTP ${resp.status}: ${text.slice(0, 300)}`);
+  }
+  // Metricool wraps POST responses as `{"data": {"id": <number>, ...}}`.
+  // Pull the ID so the caller can attach a delete button referencing it.
+  try {
+    const json = (await resp.json()) as Record<string, unknown>;
+    const data = (json && typeof json === "object" && "data" in json
+      ? json.data
+      : json) as Record<string, unknown> | undefined;
+    if (data && typeof data === "object" && "id" in data && data.id != null) {
+      return String(data.id);
+    }
+  } catch {
+    /* response wasn't JSON; that's fine — post was created, we just
+       can't add a delete button. */
+  }
+  return null;
+}
+
+async function metricoolDelete(postId: string, env: Env): Promise<void> {
+  const resp = await fetch(metricoolPostsUrl(env, postId), {
+    method: "DELETE",
+    headers: {
+      "X-Mc-Auth": env.METRICOOL_USER_TOKEN,
+      "Accept": "application/json",
+    },
+  });
+  if (!resp.ok) {
+    // Treat 404 as success — if someone manually deleted in Metricool
+    // dashboard between approve and our delete click, the desired state
+    // (post gone) is the same.
+    if (resp.status === 404) return;
+    const text = await resp.text();
+    throw new Error(`DELETE ${postId} -> HTTP ${resp.status}: ${text.slice(0, 300)}`);
   }
 }
 
@@ -365,6 +563,56 @@ async function replaceOriginal(
     });
   } catch {
     /* swallow — we already returned 200 to Slack's main handler */
+  }
+}
+
+/**
+ * Like replaceOriginal but appends a single new action button
+ * (e.g. "🗑 Delete post") below the status section.
+ */
+async function replaceOriginalWithButton(
+  payload: SlackInteractionPayload,
+  statusText: string,
+  button: { action_id: string; style?: "primary" | "danger"; text: string; value: string },
+): Promise<void> {
+  if (!payload.response_url) return;
+
+  const originalBlocks = Array.isArray(payload.message?.blocks)
+    ? (payload.message?.blocks as Array<{ type?: string }>)
+    : [];
+  const blocksKept = originalBlocks.filter((b) => b?.type !== "actions");
+  const newBlocks = [
+    ...blocksKept,
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: statusText },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          action_id: button.action_id,
+          ...(button.style ? { style: button.style } : {}),
+          text: { type: "plain_text", text: button.text, emoji: true },
+          value: button.value,
+        },
+      ],
+    },
+  ];
+
+  try {
+    await fetch(payload.response_url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        replace_original: true,
+        text: statusText,
+        blocks: newBlocks,
+      }),
+    });
+  } catch {
+    /* swallow */
   }
 }
 
