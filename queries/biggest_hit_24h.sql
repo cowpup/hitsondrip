@@ -30,7 +30,15 @@
 --
 -- Sort + limit:
 --   ORDER BY pgp.value DESC NULLS LAST -- belt-and-suspenders with the IS NOT NULL filter
---   LIMIT 1                              -- single best hit of the day
+--   LIMIT 5                              -- top 5 hits; main.py picks the
+--                                          first one whose card_image_url
+--                                          isn't on the placeholder
+--                                          blacklist (src/image_filter.py).
+--                                          Originally LIMIT 1 — bumped to 5
+--                                          to allow skipping placeholder
+--                                          images (URL pattern isn't
+--                                          diagnostic, must check content
+--                                          hash).
 
 SELECT
     card.name           AS card_name,
@@ -48,4 +56,4 @@ WHERE pp.created_at >= NOW() - INTERVAL '24 hours'
   AND card.image NOT LIKE '%video-renders%'
   AND pgp.value IS NOT NULL
 ORDER BY pgp.value DESC NULLS LAST
-LIMIT 1;
+LIMIT 5;

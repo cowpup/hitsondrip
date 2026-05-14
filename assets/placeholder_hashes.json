@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "_note": "SHA-256 hex digests of DripShopLive product images that are placeholders (generic 'image coming soon'-type stand-ins, used across many products that don't have a real photo uploaded yet). main.py downloads each candidate image, hashes it, and skips any whose hash matches. To add a new entry, run: uv run python -m tools.hash_placeholder <url>",
+  "placeholders": [
+    {
+      "sha256": "9bd598b229231ab79dac4ff42a450046a8f1d5509ea496c2864aed618dc1d8af",
+      "added_at": "2026-05-14",
+      "example_url": "https://cdn.dripshop.live/product/F4d4rBWtHHjajqiguuW76_thumbnail.webp",
+      "size_bytes": 3942,
+      "notes": "First known placeholder, reported by Noah after spotting it in a daily-post preview."
+    }
+  ]
+}

@@ -36,7 +36,7 @@ from typing import Any, Optional
 import anthropic
 from dotenv import load_dotenv
 
-from src import schedule_time, slack, string_transforms
+from src import image_filter, schedule_time, slack, string_transforms
 from src.image_host import publish_to_github, ImageHostError
 from src.renderer import RenderError, render_just_pulled
 from src.slack import SlackError
@@ -89,11 +89,12 @@ def _build_prompt() -> str:
     return f"{prompt_text}\n\n```sql\n{sql_text}\n```\n"
 
 
-def fetch_biggest_hit() -> Optional[dict[str, Any]]:
-    """Ask Claude to run the SQL via DripShopLive MCP and parse the JSON row.
+def fetch_top_hits() -> list[dict[str, Any]]:
+    """Ask Claude to run the SQL via DripShopLive MCP and parse the JSON array.
 
-    Returns the row dict, or None if there are no qualifying hits in 24h.
-    Raises on any other failure (auth, MCP transport, JSON parse).
+    Returns up to 5 rows ordered by value DESC. Empty list = no qualifying
+    hits in the last 24h. Raises on any other failure (auth, MCP transport,
+    JSON parse).
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -137,16 +138,21 @@ def fetch_biggest_hit() -> Optional[dict[str, Any]]:
     log.info("Model returned %d chars of text after %d tool calls",
              len(full_text), tool_calls)
 
-    return _parse_hit_json(full_text)
+    return _parse_hits_json(full_text)
 
 
-def _parse_hit_json(text: str) -> Optional[dict[str, Any]]:
-    """Pull the JSON object (or null) out of the model's fenced response."""
+def _parse_hits_json(text: str) -> list[dict[str, Any]]:
+    """Pull the JSON array out of the model's fenced response.
+
+    Accepts an empty array (no hits) or up to 5 hit dicts. Defensive:
+    handles a legacy single-dict response by wrapping it in a list,
+    and handles a literal `null` as an empty list.
+    """
     fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL)
     raw = fenced.group(1) if fenced else text.strip()
     raw = raw.strip()
     if raw.lower() == "null":
-        return None
+        return []
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
@@ -154,13 +160,16 @@ def _parse_hit_json(text: str) -> Optional[dict[str, Any]]:
             f"Model response wasn't valid JSON: {e}\nResponse text:\n{text[:1000]}"
         ) from e
     if parsed is None:
-        return None
-    if not isinstance(parsed, dict):
-        raise RuntimeError(
-            f"Expected a JSON object (or null) from the model, got "
-            f"{type(parsed).__name__}: {str(parsed)[:300]}"
-        )
-    return parsed
+        return []
+    if isinstance(parsed, dict):
+        # Tolerate the legacy single-object shape.
+        return [parsed]
+    if isinstance(parsed, list):
+        return [h for h in parsed if isinstance(h, dict)]
+    raise RuntimeError(
+        f"Expected a JSON array (or empty) from the model, got "
+        f"{type(parsed).__name__}: {str(parsed)[:300]}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -310,12 +319,12 @@ def build_slack_success_text(
 def run() -> int:
     """Returns 0 on success or empty-day, non-zero on any actual failure."""
     try:
-        hit = fetch_biggest_hit()
+        candidates = fetch_top_hits()
     except Exception as e:  # noqa: BLE001 — surface raw exception to Slack
         _emit_failure_to_slack("DripShopLive query failed", e)
         return 1
 
-    if hit is None:
+    if not candidates:
         log.info("No Drip-fulfilled hits in the last 24 hours.")
         try:
             slack.post_message(
@@ -327,8 +336,58 @@ def run() -> int:
             return 1
         return 0
 
-    log.info("Hit: $%s on %s from %s",
-             hit.get("hit_value"), hit.get("card_name"), hit.get("pack_name"))
+    # Iterate candidates highest-value first. Skip any whose card image
+    # matches a known placeholder hash; pick the first clean one.
+    blacklist = image_filter.load_blacklist()
+    log.info(
+        "Got %d candidate hit(s); blacklist contains %d known placeholders",
+        len(candidates), len(blacklist),
+    )
+    hit: Optional[dict[str, Any]] = None
+    skipped: list[tuple[dict[str, Any], str]] = []
+    for candidate in candidates:
+        card_url = candidate.get("card_image_url") or ""
+        if not card_url:
+            skipped.append((candidate, "no card_image_url"))
+            continue
+        blocked, reason = image_filter.is_placeholder(card_url, blacklist)
+        if blocked:
+            log.info(
+                "Skipping $%s hit on %s — %s",
+                candidate.get("hit_value"), candidate.get("card_name"), reason,
+            )
+            skipped.append((candidate, reason))
+            continue
+        hit = candidate
+        log.info("Using hit: %s (after %d skipped)", card_url, len(skipped))
+        break
+
+    if hit is None:
+        log.warning(
+            "All %d candidate hits had placeholder images; no post today.",
+            len(candidates),
+        )
+        skipped_lines = "\n".join(
+            f"  • ${c.get('hit_value')} on {c.get('card_name', '?')[:60]} — {reason}"
+            for c, reason in skipped
+        )
+        try:
+            slack.post_message(
+                f":no_entry_sign: *No usable hit today* — all "
+                f"{len(candidates)} top hits had placeholder card images.\n"
+                f"```{skipped_lines}```\n_If any of these should actually "
+                f"be postable, the renderer's filter is the issue. "
+                f"Otherwise, no action needed._"
+            )
+        except SlackError as e:
+            log.error("Slack notify failed on all-placeholder path: %s", e)
+            return 1
+        return 0
+
+    log.info(
+        "Hit: $%s on %s from %s",
+        hit.get("hit_value"), hit.get("card_name"), hit.get("pack_name"),
+    )
 
     # Render
     try:
