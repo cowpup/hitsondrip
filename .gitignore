@@ -25,6 +25,7 @@ __pycache__/
 # branch via image_host.py instead.
 test_output*.png
 test_variety_*.png
+test_new_chase*.png
 data/
 
 # IDE / OS / dev-tool local config
