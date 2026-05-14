@@ -1,74 +1,35 @@
-"""Image effects helpers — background removal + outer glow.
+"""Image effects helpers — outer glow on text + on arbitrary images.
 
-These are the two visual treatments that the "New Chase" template uses
-and that the existing "Just Pulled" Pillow renderer doesn't have yet.
-Kept as a separate module so any renderer can reuse them.
+Both effects are pure Pillow. No model downloads, no extra deps.
 
-- ``remove_background``: runs the U²-Net model via the ``rembg`` package.
-  Returns a transparent-background RGBA PIL Image. CPU inference, no
-  network call. ~2-5s per image on a modest machine; ~180MB ONNX model
-  is downloaded + cached on first run.
+- ``apply_text_glow``: Draws the text twice — first in ``glow_color``
+  with heavy Gaussian blur (the halo), then in ``text_color`` sharp
+  on top. Returns an RGBA PIL Image. Used for the "$25,000" headline
+  in the New Chase renderer.
 
-- ``apply_text_glow``: pure Pillow. Draws the text twice — first in
-  ``glow_color`` with heavy Gaussian blur (the halo), then in
-  ``text_color`` sharp on top. Returns an RGBA PIL Image sized to fit
-  the glow's blur radius. Composite onto whatever background you like.
+- ``apply_image_glow``: Same idea but for an arbitrary image. Uses the
+  image's alpha mask (or its full rectangle if no alpha) as the
+  silhouette, fills with ``glow_color``, blurs, then composites the
+  sharp original on top. Used to soften the hard black corners of
+  PSA slab photos against the cosmic background.
 
-Why a thin module instead of inline code:
-- Both effects might get reused if we add more templates later.
-- We want a clean swap point if we ever upgrade background removal to
-  ``remove.bg`` API: just replace ``remove_background``'s body, keep
-  the same signature.
+Kept in their own module so future renderers can reuse them.
+
+Earlier history (2026-05-14): this module briefly included a
+``remove_background`` helper backed by the ``rembg`` package. We
+removed it after the New Chase design pivoted to glow-on-slab rather
+than bg-removal-on-slab, and confirmed that DripShopLive's pack
+images ship as transparent PNGs by default — so nothing in the
+current pipeline needs ML-based background removal. If a future
+template requires it, add ``rembg`` back to pyproject.toml and
+restore the helper from git history.
 """
 
 from __future__ import annotations
 
-import io
-from pathlib import Path
-from typing import Tuple, Union
+from typing import Tuple
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
-
-
-# --------------------------------------------------------------------------- #
-# Background removal
-# --------------------------------------------------------------------------- #
-
-
-def remove_background(
-    source: Union[bytes, Image.Image, Path, str],
-) -> Image.Image:
-    """Strip the background from a product image; return an RGBA PIL Image.
-
-    Accepts raw bytes, an open PIL Image, a Path, or a path string.
-    Output has the foreground pixels intact and the background fully
-    transparent (alpha=0). Use Image.composite or alpha_composite to
-    drop it onto whatever new background you want.
-
-    Implementation note: ``rembg.remove`` returns bytes by default; we
-    decode them back into a PIL Image so callers don't have to know
-    or care about that ergonomic quirk.
-    """
-    # Import lazily — rembg pulls in onnxruntime, which is heavy and
-    # slow to import. Only paying the cost when actually called.
-    from rembg import remove as _rembg_remove  # type: ignore
-
-    if isinstance(source, Image.Image):
-        buf = io.BytesIO()
-        source.save(buf, format="PNG")
-        input_bytes = buf.getvalue()
-    elif isinstance(source, (Path, str)):
-        input_bytes = Path(source).read_bytes()
-    elif isinstance(source, (bytes, bytearray)):
-        input_bytes = bytes(source)
-    else:
-        raise TypeError(
-            f"remove_background expects bytes / PIL.Image / Path / str, "
-            f"got {type(source).__name__}"
-        )
-
-    output_bytes = _rembg_remove(input_bytes)
-    return Image.open(io.BytesIO(output_bytes)).convert("RGBA")
 
 
 # --------------------------------------------------------------------------- #
