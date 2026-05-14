@@ -15,7 +15,9 @@ __pycache__/
 
 # uv / virtualenv
 .venv/
-uv.lock
+# NOTE: uv.lock IS committed. For an application (vs. a library) the lockfile
+# pins exact dependency versions for reproducible CI installs — astral-sh/setup-uv@v3
+# also requires it to be present for its cache-key derivation.
 
 # Local test artifacts — these are produced by ad-hoc renderer runs
 # (uv run python -m src.renderer ...) and tools/render_recent_hits.py.
