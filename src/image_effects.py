@@ -46,6 +46,8 @@ def apply_text_glow(
     glow_radius_px: int = 18,
     glow_passes: int = 2,
     padding_px: int = 60,
+    stroke_width_px: int = 0,
+    stroke_color: Tuple[int, int, int, int] = None,  # type: ignore[assignment]
 ) -> Image.Image:
     """Render ``text`` with an outer glow halo, return an RGBA PIL Image.
 
@@ -69,10 +71,21 @@ def apply_text_glow(
         glow_passes: Run the blur this many times for a softer falloff.
         padding_px: Empty border around the text so the glow isn't clipped.
             Should be ≥ ~3× glow_radius_px to capture the full halo.
+        stroke_width_px: Pillow text stroke width (in pixels). When > 0,
+            the text glyphs are rendered with an outer stroke of that
+            thickness, making the text appear bolder. Useful when the
+            heaviest font weight available (Black) still isn't bold
+            enough for the design. The stroke is applied to BOTH the
+            glow layer and the sharp text layer so they remain
+            visually aligned.
+        stroke_color: RGBA of the stroke. Defaults to ``text_color``
+            for a "uniformly thicker glyph" effect.
 
     Returns:
         RGBA PIL Image. Foreground text is sharp, glow extends outward.
     """
+    if stroke_color is None:
+        stroke_color = text_color
     # 1) Measure the rendered text so we know how big the canvas needs to be.
     #    Use a 1×1 throwaway image to get ImageDraw.textbbox.
     measure = ImageDraw.Draw(Image.new("L", (1, 1)))
@@ -85,23 +98,29 @@ def apply_text_glow(
 
     # 2) Glow layer: text in glow_color, then blurred (twice for softer
     #    falloff). Built on its own canvas so the blur respects the
-    #    padded margins.
+    #    padded margins. Stroke applied so the glow shape matches the
+    #    sharp text shape when stroke_width_px > 0.
     glow_layer = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
     glow_draw = ImageDraw.Draw(glow_layer)
     glow_draw.text(
         (padding_px - bbox[0], padding_px - bbox[1]),
         text, font=font, fill=glow_color,
+        stroke_width=stroke_width_px,
+        stroke_fill=glow_color,
     )
     for _ in range(max(1, glow_passes)):
         glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(glow_radius_px))
 
     # 3) Sharp text layer drawn on the SAME canvas dimensions so we can
-    #    alpha-composite the two.
+    #    alpha-composite the two. Stroke makes glyphs uniformly thicker
+    #    when the source font's heaviest weight isn't bold enough.
     text_layer = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
     text_draw = ImageDraw.Draw(text_layer)
     text_draw.text(
         (padding_px - bbox[0], padding_px - bbox[1]),
         text, font=font, fill=text_color,
+        stroke_width=stroke_width_px,
+        stroke_fill=stroke_color,
     )
 
     # 4) Glow underneath, sharp text on top.
