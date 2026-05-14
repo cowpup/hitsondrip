@@ -25,6 +25,11 @@
 --   - card.cert_number IS NOT NULL: graded cards only ("Drip-fulfilled")
 --   - card.image NOT LIKE '%video-renders%': skip watermarked /video-renders/
 --     thumbnails — they're tiled with the Drip logo and unusable in a post
+--   - card.image NOT LIKE '%_thumbnail%': skip placeholder thumbnails
+--     (URLs ending in "_thumbnail.webp" / "_thumbnail.png") — these are
+--     low-resolution stand-ins shown when the real product image hasn't
+--     been uploaded yet. Rendering them at full Instagram-square size
+--     looks awful.
 --   - pgp.value IS NOT NULL: some pulls don't have a recorded value yet;
 --     they can't be the "biggest hit" and would crash the renderer
 --
@@ -46,6 +51,7 @@ JOIN box_breaks        bb  ON bb.id            = pgp.box_break_id
 WHERE pp.created_at >= NOW() - INTERVAL '24 hours'
   AND card.cert_number IS NOT NULL
   AND card.image NOT LIKE '%video-renders%'
+  AND card.image NOT LIKE '%_thumbnail%'
   AND pgp.value IS NOT NULL
 ORDER BY pgp.value DESC NULLS LAST
 LIMIT 1;
