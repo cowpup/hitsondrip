@@ -1,5 +1,5 @@
 {
-  "_comment": "Threshold tuning for the New Chase daily post. Pack metadata (name + image) is now auto-resolved per-card from the DB via the collection→box_break chain (see queries/pack_lookup_by_card.sql) — there is no longer any pack-identification config here. pack_price + chase_threshold_multiplier together derive the chase filter (card.price >= pack_price * multiplier) substituted into queries/new_chase.sql at :threshold. pack_price is a GLOBAL reference price for threshold purposes only — it does NOT have to match the actual rendered pack's price, since the rendered pack varies per-candidate. chase_threshold_multiplier defaults to 10 if omitted; lower it (5, 4, 3) to be more lenient.",
-  "pack_price": 100,
-  "chase_threshold_multiplier": 4
+  "_comment": "Threshold tuning for the New Chase daily post. Pack metadata (name + image) is auto-resolved per-card from the DB via the collection→box_break chain (see queries/pack_lookup_by_card.sql) — there is no pack-identification config here. pack_price + chase_threshold_multiplier together derive the chase filter (card.price >= pack_price * multiplier) substituted into queries/new_chase.sql at :threshold. pack_price is a GLOBAL reference price for threshold purposes only — it does NOT have to match the actual rendered pack's price, since the rendered pack varies per-candidate. Current setting (pack_price=500, multiplier=10) yields a $5000 floor — Noah's production-grade chase threshold set 2026-05-14 after E2E validation. Skip messages read 'Threshold: card.price ≥ $5000 (10× the $500 reference pack price)'.",
+  "pack_price": 500,
+  "chase_threshold_multiplier": 10
 }
