@@ -140,15 +140,18 @@ function metricoolUrl(postId: string, env: Env): string {
 /**
  * Flip a Metricool draft post to publish-at-its-scheduled-time.
  *
- * Metricool's PUT /v2/scheduler/posts/{id} validates the FULL post body —
- * partial updates with just `{autoPublish: true}` get rejected with a 400
- * ("update.arg3.text must not be null", etc.). So we GET the current post,
- * mutate the flags we care about, then PUT it back whole.
+ * Metricool's PUT /v2/scheduler/posts/{id} is annoyingly picky:
+ *   1. It validates the FULL post body — partial updates with just
+ *      `{autoPublish: true}` get 400 ("update.arg3.text must not be null").
+ *   2. The GET response includes server-managed fields that PUT can't
+ *      deserialize back: each provider has `status` + `detailedStatus`
+ *      enums that Jackson refuses to re-parse from their string form
+ *      ("Cannot construct instance of PublicationStatusCode").
+ *   3. Network-specific data blocks (instagramData, twitterData, etc.)
+ *      have their OWN nested `autoPublish` flag that needs flipping too.
  *
- * (Discovered the hard way on 2026-05-14 when an approve click came back
- * with a 400 in Slack. The partial-PUT may also have a side effect of
- * persisting partial fields anyway — doing the full GET-then-PUT
- * sidesteps that ambiguity.)
+ * So this is GET → sanitize → flip flags → PUT. Discovered all three
+ * the hard way on 2026-05-14.
  */
 async function publishPost(postId: string, env: Env): Promise<true> {
   const url = metricoolUrl(postId, env);
@@ -175,12 +178,20 @@ async function publishPost(postId: string, env: Env): Promise<true> {
     throw new Error(`GET ${postId} returned unexpected shape: ${JSON.stringify(raw).slice(0, 300)}`);
   }
 
-  // 2) Flip the flags. Keep every other field intact.
-  const updated: Record<string, unknown> = {
-    ...post,
-    autoPublish: true,
-    draft: false,
-  };
+  // 2) Sanitize + flip flags
+  const updated = sanitizeForPut(post);
+  updated.autoPublish = true;
+  updated.draft = false;
+  // Also flip the nested autoPublish on each network-specific data block.
+  // Without this, IG (and X) sometimes stay in pending even when the
+  // top-level flag is true — Metricool reads the nested one for some
+  // publish-eligibility checks.
+  for (const dataKey of ["instagramData", "twitterData", "facebookData", "threadsData"]) {
+    const block = updated[dataKey];
+    if (block && typeof block === "object") {
+      updated[dataKey] = { ...(block as Record<string, unknown>), autoPublish: true };
+    }
+  }
 
   // 3) PUT the full body back.
   const putResp = await fetch(url, {
@@ -197,6 +208,40 @@ async function publishPost(postId: string, env: Env): Promise<true> {
     throw new Error(`PUT ${postId} -> HTTP ${putResp.status}: ${text.slice(0, 300)}`);
   }
   return true;
+}
+
+/**
+ * Strip server-managed fields from a Metricool post body before PUT.
+ * Without this Metricool's Jackson deserializer rejects the body with
+ * various "no String-argument constructor" errors on read-only enums.
+ */
+function sanitizeForPut(post: Record<string, unknown>): Record<string, unknown> {
+  const TOP_LEVEL_STRIP = new Set([
+    "id", "uuid", "creationDate", "creatorUserMail", "creatorUserId",
+  ]);
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(post)) {
+    if (TOP_LEVEL_STRIP.has(k)) continue;
+    if (k === "providers" && Array.isArray(v)) {
+      // Drop status + detailedStatus from each provider — they're
+      // read-only enums Metricool can't deserialize on PUT.
+      out[k] = v.map((p) => {
+        if (p && typeof p === "object") {
+          const provider = p as Record<string, unknown>;
+          const cleaned: Record<string, unknown> = {};
+          for (const [pk, pv] of Object.entries(provider)) {
+            if (pk === "status" || pk === "detailedStatus") continue;
+            cleaned[pk] = pv;
+          }
+          return cleaned;
+        }
+        return p;
+      });
+      continue;
+    }
+    out[k] = v;
+  }
+  return out;
 }
 
 async function deletePost(postId: string, env: Env): Promise<true> {
