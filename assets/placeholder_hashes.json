@@ -8,6 +8,13 @@
       "example_url": "https://cdn.dripshop.live/product/F4d4rBWtHHjajqiguuW76_thumbnail.webp",
       "size_bytes": 3942,
       "notes": "First known placeholder, reported by Noah after spotting it in a daily-post preview."
+    },
+    {
+      "sha256": "a05c3e78658bb8cf1d3d5b924c6f955e404a751c6344fcdf216690b8ba8f17ae",
+      "added_at": "2026-05-14",
+      "example_url": "https://cdn.dripshop.live/product/BH_DdscLUocdkp6b-k8n2.webp",
+      "size_bytes": 11086,
+      "notes": "Generic Charizard V stand-in image attached to PSA 10 Charizard V hits — looks like a real card but is the same image across many graded Charizard products. Noah flagged 2026-05-14."
     }
   ]
 }
