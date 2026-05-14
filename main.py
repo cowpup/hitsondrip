@@ -409,11 +409,23 @@ def run() -> int:
 
     # Upload
     try:
-        image_url = publish_to_github(png_bytes)
-        log.info("Uploaded to %s", image_url)
+        raw_image_url = publish_to_github(png_bytes)
+        log.info("Uploaded to %s", raw_image_url)
     except ImageHostError as e:
         _emit_failure_to_slack("Image host upload failed", e)
         return 1
+
+    # Cache-bust the image URL before handing it to Slack / Metricool.
+    # raw.githubusercontent.com is fronted by Fastly; we overwrite the
+    # SAME `latest.png` URL every day, so without a unique query string
+    # Slack's image-preview CDN serves the previously-cached render
+    # (we hit this 2026-05-14 — a fresh Beedrill render appeared in the
+    # Slack preview as the cached Charizard from earlier the same day).
+    # Appending a unique `?v=<run-epoch>` makes Slack/Metricool treat
+    # each daily run's image as a new URL → fresh fetch. The query
+    # string doesn't affect what GitHub serves (same file either way).
+    import time as _time
+    image_url = f"{raw_image_url}?v={int(_time.time())}"
 
     # Build the post payload for Slack-button-driven approval. The Slack
     # message carries everything the Cloudflare Worker needs to create
