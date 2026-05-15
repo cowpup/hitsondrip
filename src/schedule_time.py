@@ -1,16 +1,19 @@
-"""Compute the next 6pm Pacific Time slot for the daily Metricool schedule.
+"""Compute the next "wall-clock target time" Pacific Time slot.
 
-The cron fires at 12pm PT every day; the daily IG post is scheduled for
-6pm PT the same day. If the cron is manually triggered AFTER 6pm PT
-(workflow_dispatch), the post goes out tomorrow at 6pm PT instead — we
-never schedule a slot in the past.
+Each daily automation publishes at a fixed wall-clock time. The cron
+fires earlier (e.g. 12pm PT for Just Pulled, 10am PT for New Chase),
+and the post is scheduled via Metricool for the target time. If the
+cron is manually triggered AFTER the target, the post goes out
+tomorrow at the same wall-clock time instead — we never schedule a
+slot in the past.
 
 Metricool's API expects a NAIVE wall-clock timestamp paired with a
 separate IANA timezone string (see src/metricool.py:schedule_instagram_post
 for the contract). This module returns exactly that pairing.
 
 DST is handled by zoneinfo — "America/Los_Angeles" auto-shifts between
-PST (UTC-8) and PDT (UTC-7); the wall-clock "6pm PT" stays 6pm in both.
+PST (UTC-8) and PDT (UTC-7); the wall-clock target stays the same in
+both, e.g. "6pm PT" is 6pm year-round.
 """
 
 from __future__ import annotations
@@ -20,49 +23,79 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 PACIFIC_TZ_NAME = "America/Los_Angeles"
-TARGET_HOUR = 18           # 6pm in 24h time
-TARGET_MINUTE = 0
-TARGET_SECOND = 0
 
 
-def next_6pm_pt(*, now: Optional[datetime] = None) -> tuple[str, str]:
-    """Return ``(naive_iso, tz_name)`` for the next 6pm PT slot.
+def next_target_pt(
+    *,
+    hour: int,
+    minute: int = 0,
+    second: int = 0,
+    now: Optional[datetime] = None,
+) -> tuple[str, str]:
+    """Return ``(naive_iso, tz_name)`` for the next ``hour:minute`` PT slot.
 
     Args:
-        now: Optional override for "now" (must be tz-aware). Defaults to
-            datetime.now(ZoneInfo(PACIFIC_TZ_NAME)). The override is what
-            makes this testable across DST boundaries without monkeypatching.
+        hour: Target wall-clock hour in 24h time (0-23). E.g. 18 = 6pm,
+            17 = 5pm.
+        minute: Target minute (0-59). Defaults to 0.
+        second: Target second (0-59). Defaults to 0. Almost always
+            left at 0; exposed so the caller can produce e.g. 5:15:00.
+        now: Optional override for "now" (must be tz-aware). Defaults
+            to ``datetime.now(ZoneInfo(PACIFIC_TZ_NAME))``. The
+            override is what makes this testable across DST boundaries
+            without monkeypatching.
 
     Returns:
         A two-tuple of:
-          - naive_iso: "YYYY-MM-DDTHH:MM:SS" with no Z and no offset. This
-            is the wall-clock time in Pacific. Metricool requires the
-            string without any timezone suffix.
-          - tz_name: "America/Los_Angeles" (always). Metricool pairs the
-            naive timestamp with this separately.
+          - naive_iso: "YYYY-MM-DDTHH:MM:SS" with no Z and no offset.
+            This is the wall-clock time in Pacific. Metricool requires
+            the string without any timezone suffix.
+          - tz_name: "America/Los_Angeles" (always). Metricool pairs
+            the naive timestamp with this separately.
 
     Logic:
-      - If `now` is before today's 6pm PT, target = today 6pm PT.
-      - If `now` is at or after today's 6pm PT, target = tomorrow 6pm PT.
-        (We use >= so that exactly-at-6pm runs schedule for tomorrow,
-        avoiding any race with Metricool's "publish in the past" rejection.)
+      - If ``now`` is before today's target, target = today at target.
+      - If ``now`` is at or after today's target, target = tomorrow at target.
+        (We use ``>=`` so that exactly-at-target runs schedule for
+        tomorrow, avoiding any race with Metricool's "publish in the
+        past" rejection.)
     """
     pacific = ZoneInfo(PACIFIC_TZ_NAME)
     if now is None:
         now = datetime.now(pacific)
     else:
-        # Convert into Pacific so all the wall-clock math below stays in
-        # the post timezone. If naive, assume Pacific (a friendly default
-        # but tests should pass a tz-aware datetime).
+        # Convert into Pacific so all the wall-clock math below stays
+        # in the post timezone. If naive, assume Pacific (a friendly
+        # default — tests should pass a tz-aware datetime).
         if now.tzinfo is None:
             now = now.replace(tzinfo=pacific)
         else:
             now = now.astimezone(pacific)
 
-    today_6pm = now.replace(
-        hour=TARGET_HOUR, minute=TARGET_MINUTE, second=TARGET_SECOND, microsecond=0,
+    today_target = now.replace(
+        hour=hour, minute=minute, second=second, microsecond=0,
     )
-    target = today_6pm if now < today_6pm else today_6pm + timedelta(days=1)
+    target = today_target if now < today_target else today_target + timedelta(days=1)
+    return target.strftime("%Y-%m-%dT%H:%M:%S"), PACIFIC_TZ_NAME
 
-    naive_iso = target.strftime("%Y-%m-%dT%H:%M:%S")
-    return naive_iso, PACIFIC_TZ_NAME
+
+# ----- Backward-compatible wrappers ------------------------------------- #
+
+
+def next_6pm_pt(*, now: Optional[datetime] = None) -> tuple[str, str]:
+    """Return the next 6pm PT slot. Used by main.py (Just Pulled).
+
+    Thin wrapper around ``next_target_pt(hour=18)``. Kept for backward
+    compatibility with main.py + its tests.
+    """
+    return next_target_pt(hour=18, now=now)
+
+
+def next_5pm_pt(*, now: Optional[datetime] = None) -> tuple[str, str]:
+    """Return the next 5pm PT slot. Used by new_chase.py.
+
+    Thin wrapper around ``next_target_pt(hour=17)``. Set 2026-05-14 to
+    give a 1-hour separation between New Chase (5pm) and Just Pulled
+    (6pm) on days when both automations qualify.
+    """
+    return next_target_pt(hour=17, now=now)

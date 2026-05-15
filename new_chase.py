@@ -736,7 +736,9 @@ def run() -> int:
     image_url = raw_image_url
 
     # --- Compose payload + post Slack ---------------------------------------
-    publish_iso, publish_tz = schedule_time.next_6pm_pt()
+    # New Chase publishes at 5pm PT (IG) + 5:15pm PT (X) — gives a
+    # 1-hour gap vs Just Pulled's 6pm/6:15pm on dual-qualifying days.
+    publish_iso, publish_tz = schedule_time.next_5pm_pt()
     publish_dt = datetime.fromisoformat(publish_iso)
     x_publish_dt = publish_dt + timedelta(minutes=15)
     x_publish_iso = x_publish_dt.strftime("%Y-%m-%dT%H:%M:%S")
