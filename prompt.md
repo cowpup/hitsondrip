@@ -13,6 +13,7 @@ Respond with exactly one fenced ```json``` block containing a JSON ARRAY of the 
 ```json
 [
   {
+    "hit_id": <number>,
     "card_name": "...",
     "card_image_url": "https://cdn.dripshop.live/product/...",
     "pack_name": "...",

@@ -36,10 +36,11 @@ from typing import Any, Optional
 import anthropic
 from dotenv import load_dotenv
 
-from src import image_filter, schedule_time, slack, string_transforms
+from src import image_filter, schedule_time, slack, state_branch, string_transforms
 from src.image_host import publish_to_github, ImageHostError
 from src.renderer import RenderError, render_just_pulled
 from src.slack import SlackError
+from src.state_branch import StateBranchError
 
 # --------------------------------------------------------------------------- #
 # Config + logging
@@ -389,6 +390,47 @@ def run() -> int:
         hit.get("hit_value"), hit.get("card_name"), hit.get("pack_name"),
     )
 
+    # --- De-dup guard ------------------------------------------------------
+    # Unlike New Chase (which skips a deduped candidate and shows the NEXT
+    # one), Just Pulled features the SINGLE biggest hit of the day. So we
+    # select the top usable hit FIRST (loop above), then compare it to the
+    # last hit we posted. If it matches, a prior run already sent an
+    # approval card for this exact hit — skip the WHOLE run rather than
+    # demote to a smaller hit. This stops a manual workflow_dispatch rerun
+    # (or an occasional double-fired schedule) from producing a second
+    # approval card → duplicate IG/X posts.
+    hit_id = hit.get("hit_id")
+    try:
+        last_hit_id = state_branch.read_last_hit_id()
+    except StateBranchError as e:
+        # Fail closed: without state we can't de-dup, and posting a
+        # possible duplicate is worse than missing one run (mirrors
+        # new_chase.py's read-error handling).
+        _emit_failure_to_slack("State branch read failed", e)
+        return 1
+    log.info("Last posted hit_id: %r (this hit: %r)", last_hit_id, hit_id)
+
+    if (
+        hit_id is not None
+        and last_hit_id is not None
+        and int(hit_id) == int(last_hit_id)
+    ):
+        log.info(
+            "Hit id=%s already posted on a prior run; skipping to avoid a "
+            "duplicate.", hit_id,
+        )
+        try:
+            slack.post_message(
+                f":repeat: *Already posted* — the biggest hit in the last 24h "
+                f"(${int(round(float(hit['hit_value'])))} on "
+                f"{hit.get('card_name', '?')}, id={hit_id}) already went out "
+                f"for approval on an earlier run. No new post created."
+            )
+        except SlackError as e:
+            log.error("Slack notify failed on already-posted path: %s", e)
+            return 1
+        return 0
+
     # Render
     try:
         pack_url = hit.get("pack_image_url") or FALLBACK_PACK_IMAGE_URL
@@ -473,9 +515,32 @@ def run() -> int:
     except SlackError as e:
         # Render succeeded, image hosted — but we couldn't notify. Fail
         # the run so we see it in GitHub Actions and don't silently miss
-        # a day.
+        # a day. State is NOT written (below), so a retry re-posts cleanly.
         _emit_failure_to_slack("Slack notify failed", e)
         return 1
+
+    # --- Record state ------------------------------------------------------
+    # Written AFTER the approval card posts (not on Worker ✅) so a same-day
+    # rerun won't regenerate a card for this hit. Semantic mirrors
+    # new_chase: state = "hit already presented to Noah." If Noah ❌ Skips,
+    # we still won't re-show it. A failed run above returns non-zero and
+    # leaves state untouched so it retries. On write failure we log +
+    # Slack-warn but DON'T fail the run — the card is already out; risking
+    # a duplicate beats aborting a successful post.
+    if hit_id is not None:
+        try:
+            state_branch.write_last_hit_id(int(hit_id))
+            log.info("Wrote state: last_hit_id=%s", hit_id)
+        except StateBranchError as e:
+            log.error("State branch write FAILED (continuing): %s", e)
+            try:
+                slack.post_message(
+                    f":warning: Just Pulled post succeeded BUT state write "
+                    f"failed: `{e}`. A rerun may re-show hit id `{hit_id}` — "
+                    f"manually update `state/last_hit_id.txt` if needed."
+                )
+            except SlackError:
+                pass
 
     return 0
 

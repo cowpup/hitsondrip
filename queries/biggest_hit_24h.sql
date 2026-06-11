@@ -5,7 +5,9 @@
 --   product_purchases (pp): the purchase row recorded when a customer paid
 --     for an instant pack and "won" the card. pp.product_id points to the
 --     CARD that was pulled; pp.unit_price is the pack price paid; pp.created_at
---     is the purchase timestamp.
+--     is the purchase timestamp. pp.id is the stable per-hit key main.py
+--     stores on the `state` branch to de-dup re-runs (see src/state_branch.py)
+--     so the same hit can't generate two approval cards / two posts.
 --   pull_game_pulls (pgp): one row per card pulled in a box break, links a
 --     purchase to a box_break and records the card's estimated market value.
 --     pgp.purchase_id (int) → pp.id; pgp.box_break_id (uuid) → bb.id;
@@ -44,6 +46,7 @@
 --                                          hash).
 
 SELECT
+    pp.id               AS hit_id,
     card.name           AS card_name,
     card.image          AS card_image_url,
     bb.title            AS pack_name,
