@@ -27,6 +27,9 @@
 --     thumbnails — they're tiled with the Drip logo and unusable in a post
 --   - pgp.value IS NOT NULL: some pulls don't have a recorded value yet;
 --     they can't be the "biggest hit" and would crash the renderer
+--   - pgp.value >= 1000: only surface hits worth $1,000 or more. On days
+--     where the biggest hit is under $1k the query returns zero rows and
+--     main.py posts the "no hits" Slack notice instead of scheduling a post.
 --
 -- Sort + limit:
 --   ORDER BY pgp.value DESC NULLS LAST -- belt-and-suspenders with the IS NOT NULL filter
@@ -55,5 +58,6 @@ WHERE pp.created_at >= NOW() - INTERVAL '24 hours'
   AND card.cert_number IS NOT NULL
   AND card.image NOT LIKE '%video-renders%'
   AND pgp.value IS NOT NULL
+  AND pgp.value >= 1000
 ORDER BY pgp.value DESC NULLS LAST
 LIMIT 5;
