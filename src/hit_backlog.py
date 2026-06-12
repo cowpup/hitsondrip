@@ -50,10 +50,11 @@ def ensure_shape(backlog: Optional[dict]) -> dict:
 def parse_pulled_at(value: Any, now: datetime) -> datetime:
     """Parse a DB timestamp into a tz-aware UTC datetime.
 
-    Accepts ISO 8601 with a trailing 'Z' or a space separator. A naive
-    timestamp is assumed UTC. Anything unparseable falls back to `now`
-    (treats the hit as fresh — it won't be wrongly expired, and sorts as
-    newest under FIFO)."""
+    Accepts ISO 8601 with a trailing 'Z', a numeric UTC offset (e.g.
+    '+00:00'), or a space separator between date and time; naive timestamps
+    are assumed UTC. Anything unparseable falls back to `now` (treats the
+    hit as fresh — it won't be wrongly expired, and sorts as newest under
+    FIFO)."""
     if not isinstance(value, str):
         return now
     text = value.strip().replace(" ", "T", 1)
@@ -135,6 +136,9 @@ def _record_consumed(backlog: dict, hit: dict, now: datetime) -> None:
         backlog["recently_posted"].append(
             {"hit_id": int(hid), "at": now.isoformat()}
         )
+    else:
+        log.warning("Consumed a hit with no hit_id; not recorded: %r",
+                    hit.get("card_name"))
 
 
 def pop_next_usable(
@@ -154,7 +158,7 @@ def pop_next_usable(
         key=lambda h: parse_pulled_at(h.get("pulled_at"), now),
     )
     for hit in ordered:
-        backlog["queue"].remove(hit)
+        backlog["queue"] = [h for h in backlog["queue"] if h is not hit]
         url = hit.get("card_image_url") or ""
         if not url:
             log.info("Discarding queued hit %s — no card_image_url",

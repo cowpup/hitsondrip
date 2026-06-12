@@ -179,6 +179,22 @@ class TestPopNextUsable:
         b = hb.empty_backlog()
         assert hb.pop_next_usable(b, self._never_placeholder, _now()) is None
 
+    def test_identity_removal_distinguishes_value_equal_dicts(self):
+        """Identity-based removal must remove the correct object when two
+        hits are value-equal in every field except hit_id."""
+        older = _hit(101, pulled_at="2026-06-11T06:00:00Z")
+        newer = _hit(102, pulled_at="2026-06-11T08:00:00Z")
+        # Make everything except hit_id and pulled_at identical so that a
+        # value-equality remove could pick the wrong one.
+        older["card_name"] = newer["card_name"] = "Identical Card"
+        b = {"queue": [older, newer], "recently_posted": []}
+        chosen = hb.pop_next_usable(b, self._never_placeholder, _now())
+        # FIFO: oldest (hit_id 101) must be returned.
+        assert chosen["hit_id"] == 101
+        # Exactly one item must remain, and it must be the newer object.
+        assert len(b["queue"]) == 1
+        assert b["queue"][0]["hit_id"] == 102
+
 
 class TestMarkPosted:
     def test_appends_to_recently_posted(self):
