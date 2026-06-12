@@ -43,3 +43,49 @@ class TestFoundations:
     def test_parse_pulled_at_unparseable_falls_back_to_now(self):
         assert hb.parse_pulled_at("not-a-date", _now()) == _now()
         assert hb.parse_pulled_at(None, _now()) == _now()
+
+
+def _hit(hit_id, pulled_at="2026-06-11T07:00:00Z", value=1500.0):
+    return {
+        "hit_id": hit_id,
+        "pulled_at": pulled_at,
+        "hit_value": value,
+        "card_name": f"Card {hit_id}",
+        "card_image_url": f"https://cdn/{hit_id}.webp",
+        "pack_name": "Charizard Pack",
+        "pack_image_url": "https://cdn/pack.png",
+        "pack_price": 250.0,
+    }
+
+
+class TestMergeNew:
+    def test_adds_new_hits_to_empty_queue(self):
+        b = hb.empty_backlog()
+        added = hb.merge_new(b, [_hit(1), _hit(2)])
+        assert added == 2
+        assert [h["hit_id"] for h in b["queue"]] == [1, 2]
+
+    def test_skips_hits_already_in_queue(self):
+        b = {"queue": [_hit(1)], "recently_posted": []}
+        added = hb.merge_new(b, [_hit(1), _hit(2)])
+        assert added == 1
+        assert [h["hit_id"] for h in b["queue"]] == [1, 2]
+
+    def test_skips_hits_in_recently_posted(self):
+        b = {"queue": [], "recently_posted": [{"hit_id": 9, "at": "x"}]}
+        added = hb.merge_new(b, [_hit(9), _hit(10)])
+        assert added == 1
+        assert [h["hit_id"] for h in b["queue"]] == [10]
+
+    def test_skips_hits_without_hit_id(self):
+        b = hb.empty_backlog()
+        bad = {"card_name": "no id"}
+        added = hb.merge_new(b, [bad, _hit(3)])
+        assert added == 1
+        assert [h["hit_id"] for h in b["queue"]] == [3]
+
+    def test_dedups_within_same_batch(self):
+        b = hb.empty_backlog()
+        added = hb.merge_new(b, [_hit(5), _hit(5)])
+        assert added == 1
+        assert [h["hit_id"] for h in b["queue"]] == [5]

@@ -67,3 +67,35 @@ def parse_pulled_at(value: Any, now: datetime) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _known_ids(backlog: dict) -> set[int]:
+    ids: set[int] = set()
+    for h in backlog["queue"]:
+        hid = h.get("hit_id")
+        if hid is not None:
+            ids.add(int(hid))
+    for r in backlog["recently_posted"]:
+        hid = r.get("hit_id")
+        if hid is not None:
+            ids.add(int(hid))
+    return ids
+
+
+def merge_new(backlog: dict, hits: list[dict]) -> int:
+    """Append hits whose hit_id isn't already in queue or recently_posted.
+    Skips hits missing a hit_id. Returns the number added."""
+    known = _known_ids(backlog)
+    added = 0
+    for h in hits:
+        hid = h.get("hit_id")
+        if hid is None:
+            log.warning("Skipping hit with no hit_id: %r", h.get("card_name"))
+            continue
+        hid = int(hid)
+        if hid in known:
+            continue
+        backlog["queue"].append(h)
+        known.add(hid)
+        added += 1
+    return added
