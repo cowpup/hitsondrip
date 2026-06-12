@@ -127,3 +127,49 @@ def expire(
     backlog["recently_posted"] = kept_posted
 
     return dropped, pruned
+
+
+def _record_consumed(backlog: dict, hit: dict, now: datetime) -> None:
+    hid = hit.get("hit_id")
+    if hid is not None:
+        backlog["recently_posted"].append(
+            {"hit_id": int(hid), "at": now.isoformat()}
+        )
+
+
+def pop_next_usable(
+    backlog: dict,
+    is_placeholder: Callable[[str], bool],
+    now: datetime,
+) -> Optional[dict]:
+    """Pop the oldest usable hit (FIFO by pulled_at).
+
+    Removes and permanently consumes any head whose card image is missing
+    or a placeholder (recording it in recently_posted). The returned hit
+    is removed from the queue but NOT marked posted — the caller calls
+    mark_posted() after a successful Slack post. Returns None if the queue
+    drains without a usable hit."""
+    ordered = sorted(
+        backlog["queue"],
+        key=lambda h: parse_pulled_at(h.get("pulled_at"), now),
+    )
+    for hit in ordered:
+        backlog["queue"].remove(hit)
+        url = hit.get("card_image_url") or ""
+        if not url:
+            log.info("Discarding queued hit %s — no card_image_url",
+                     hit.get("hit_id"))
+            _record_consumed(backlog, hit, now)
+            continue
+        if is_placeholder(url):
+            log.info("Discarding queued hit %s — placeholder image",
+                     hit.get("hit_id"))
+            _record_consumed(backlog, hit, now)
+            continue
+        return hit
+    return None
+
+
+def mark_posted(backlog: dict, hit: dict, now: datetime) -> None:
+    """Record a successfully-posted hit in recently_posted."""
+    _record_consumed(backlog, hit, now)

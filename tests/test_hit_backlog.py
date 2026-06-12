@@ -123,3 +123,67 @@ class TestExpire:
         _, pruned = hb.expire(b, _now())
         assert pruned == 1
         assert [r["hit_id"] for r in b["recently_posted"]] == [2]
+
+
+class TestPopNextUsable:
+    def _never_placeholder(self, url):
+        return False
+
+    def test_returns_oldest_by_pulled_at(self):
+        b = {
+            "queue": [
+                _hit(2, pulled_at="2026-06-11T09:00:00Z"),
+                _hit(1, pulled_at="2026-06-11T07:00:00Z"),  # oldest
+            ],
+            "recently_posted": [],
+        }
+        chosen = hb.pop_next_usable(b, self._never_placeholder, _now())
+        assert chosen["hit_id"] == 1
+        # Removed from queue, NOT yet in recently_posted (caller marks it).
+        assert [h["hit_id"] for h in b["queue"]] == [2]
+        assert b["recently_posted"] == []
+
+    def test_skips_and_discards_placeholder_heads(self):
+        def is_ph(url):
+            return url.endswith("/1.webp")  # hit 1 is a placeholder
+        b = {
+            "queue": [
+                _hit(1, pulled_at="2026-06-11T07:00:00Z"),  # placeholder
+                _hit(2, pulled_at="2026-06-11T08:00:00Z"),  # usable
+            ],
+            "recently_posted": [],
+        }
+        chosen = hb.pop_next_usable(b, is_ph, _now())
+        assert chosen["hit_id"] == 2
+        assert b["queue"] == []  # both removed (1 discarded, 2 returned)
+        # placeholder 1 recorded as consumed; 2 left for caller to mark.
+        assert [r["hit_id"] for r in b["recently_posted"]] == [1]
+
+    def test_discards_hits_without_card_image_url(self):
+        broken = _hit(1)
+        broken["card_image_url"] = ""
+        b = {"queue": [broken, _hit(2, pulled_at="2026-06-11T08:00:00Z")],
+             "recently_posted": []}
+        chosen = hb.pop_next_usable(b, self._never_placeholder, _now())
+        assert chosen["hit_id"] == 2
+        assert [r["hit_id"] for r in b["recently_posted"]] == [1]
+
+    def test_returns_none_when_all_placeholder(self):
+        b = {"queue": [_hit(1), _hit(2)], "recently_posted": []}
+        chosen = hb.pop_next_usable(b, lambda url: True, _now())
+        assert chosen is None
+        assert b["queue"] == []
+        assert {r["hit_id"] for r in b["recently_posted"]} == {1, 2}
+
+    def test_returns_none_on_empty_queue(self):
+        b = hb.empty_backlog()
+        assert hb.pop_next_usable(b, self._never_placeholder, _now()) is None
+
+
+class TestMarkPosted:
+    def test_appends_to_recently_posted(self):
+        b = hb.empty_backlog()
+        hb.mark_posted(b, _hit(7), _now())
+        assert b["recently_posted"] == [
+            {"hit_id": 7, "at": "2026-06-11T18:00:00+00:00"}
+        ]
