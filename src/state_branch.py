@@ -7,8 +7,8 @@ lives on `main`; the state branch never has any code committed to it.
 Two independent automations each keep their own state file:
   - New Chase  → state/last_chase_card_id.txt  (the card_product_id of
     the last chase we posted; see new_chase.py)
-  - Just Pulled → state/last_hit_id.txt        (the product_purchases.id
-    of the last hit we posted an approval card for; see main.py)
+  - Just Pulled → state/hit_backlog.json       (FIFO queue of pending
+    $1k+ graded hits; see main.py + src/hit_backlog.py)
 
 Keeping them in separate files means the two crons can never clobber
 each other's de-dup state.
@@ -22,29 +22,31 @@ Why an orphan branch over actions/cache:
     an audit log of which post went out on which day.
 
 Contract (per automation):
-  read_last_card_id() / read_last_hit_id() — return the stored int id,
-      or None if the file/branch doesn't exist yet (first run).
-  write_last_card_id(id) / write_last_hit_id(id) — overwrite the file
-      with the new id and commit via the Contents API.
+  New Chase:   read_last_card_id() / write_last_card_id(id)
+  Just Pulled: read_hit_backlog() / write_hit_backlog(backlog)
 
 Required env (same as image_host.py):
   GITHUB_TOKEN — auto-injected by Actions with `contents: write`.
   GITHUB_REPO  — "owner/repo" form.
 
 Local-dev fallback:
-  If GITHUB_TOKEN is missing, falls back to data/<file>.txt so the
+  If GITHUB_TOKEN is missing, falls back to data/<file> so the
   pipeline can be exercised locally without touching real GitHub.
 """
 
 from __future__ import annotations
 
 import base64
+import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import requests
+
+log = logging.getLogger(__name__)
 
 GITHUB_API_BASE = "https://api.github.com"
 STATE_BRANCH = "state"
@@ -54,9 +56,9 @@ DEFAULT_TIMEOUT_SECONDS = 30
 CHASE_STATE_FILENAME = "state/last_chase_card_id.txt"
 CHASE_LOCAL_FALLBACK_PATH = Path("data") / "last_chase_card_id.txt"
 
-# Just Pulled de-dup (product_purchases.id of the last posted hit).
-HIT_STATE_FILENAME = "state/last_hit_id.txt"
-HIT_LOCAL_FALLBACK_PATH = Path("data") / "last_hit_id.txt"
+# Just Pulled de-dup + backlog (JSON queue of pending $1k+ graded hits).
+HIT_BACKLOG_FILENAME = "state/hit_backlog.json"
+HIT_BACKLOG_LOCAL_PATH = Path("data") / "hit_backlog.json"
 
 
 class StateBranchError(RuntimeError):
@@ -81,20 +83,16 @@ def _resolve_repo() -> Optional[tuple[str, str, str]]:
     return owner, repo, token
 
 
-def _read_last_id(remote_filename: str, local_path: Path) -> Optional[int]:
-    """Fetch the previously-stored id, or None on first run.
-
-    A 404 from the Contents API (file or branch doesn't exist yet) is
-    the expected first-run state — return None so the caller treats any
-    candidate as new. Any other failure raises StateBranchError.
-    """
+def _read_raw_state(remote_filename: str, local_path: Path) -> Optional[str]:
+    """Return the decoded UTF-8 contents of a state file, or None if it
+    doesn't exist yet (Contents API 404, or no local fallback file).
+    Raises StateBranchError on network / HTTP failure."""
     env = _resolve_repo()
     if env is None:
-        # Local fallback
         if local_path.exists():
             try:
-                return int(local_path.read_text(encoding="utf-8").strip())
-            except (OSError, ValueError):
+                return local_path.read_text(encoding="utf-8")
+            except OSError:
                 return None
         return None
 
@@ -102,63 +100,43 @@ def _read_last_id(remote_filename: str, local_path: Path) -> Optional[int]:
     url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{remote_filename}"
     try:
         response = requests.get(
-            url,
-            headers=_api_headers(token),
-            params={"ref": STATE_BRANCH},
-            timeout=DEFAULT_TIMEOUT_SECONDS,
+            url, headers=_api_headers(token),
+            params={"ref": STATE_BRANCH}, timeout=DEFAULT_TIMEOUT_SECONDS,
         )
     except requests.RequestException as e:
         raise StateBranchError(f"GitHub GET {url}: {e}") from e
 
     if response.status_code == 404:
-        # First run, or branch doesn't exist yet.
         return None
     if response.status_code >= 400:
         raise StateBranchError(
             f"GitHub GET {url} → HTTP {response.status_code}: "
             f"{response.text[:400]}"
         )
-
     encoded = response.json().get("content", "")
     try:
-        raw = base64.b64decode(encoded).decode("utf-8").strip()
-        return int(raw)
+        return base64.b64decode(encoded).decode("utf-8")
     except (ValueError, UnicodeDecodeError):
-        # Corrupt state — treat as no prior state.
         return None
 
 
-def _write_last_id(
-    value: int,
-    remote_filename: str,
-    local_path: Path,
-    commit_prefix: str,
+def _write_raw_state(
+    text: str, remote_filename: str, local_path: Path, commit_message: str
 ) -> None:
-    """Overwrite the given state file with `value`.
-
-    Uses the Contents API PUT, which requires the existing file's SHA
-    when updating. We fetch that SHA inline (one extra round-trip per
-    run) rather than caching it from the read, so this function works
-    correctly even when called from a different process.
-
-    Raises StateBranchError on API failure.
-    """
+    """Overwrite a state file with `text`. Raises StateBranchError on
+    API failure."""
     env = _resolve_repo()
     if env is None:
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.write_text(f"{value}\n", encoding="utf-8")
+        local_path.write_text(text, encoding="utf-8")
         return
 
     owner, repo, token = env
     url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{remote_filename}"
-
-    # Get current SHA (None on first-ever write).
     try:
         sha_response = requests.get(
-            url,
-            headers=_api_headers(token),
-            params={"ref": STATE_BRANCH},
-            timeout=DEFAULT_TIMEOUT_SECONDS,
+            url, headers=_api_headers(token),
+            params={"ref": STATE_BRANCH}, timeout=DEFAULT_TIMEOUT_SECONDS,
         )
     except requests.RequestException as e:
         raise StateBranchError(f"GitHub GET {url}: {e}") from e
@@ -172,12 +150,9 @@ def _write_last_id(
             f"{sha_response.text[:400]}"
         )
 
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     body: dict[str, object] = {
-        "message": f"{commit_prefix}={value} @ {ts}",
-        "content": base64.b64encode(
-            f"{value}\n".encode("utf-8")
-        ).decode("ascii"),
+        "message": commit_message,
+        "content": base64.b64encode(text.encode("utf-8")).decode("ascii"),
         "branch": STATE_BRANCH,
     }
     if existing_sha:
@@ -185,9 +160,7 @@ def _write_last_id(
 
     try:
         put_response = requests.put(
-            url,
-            headers=_api_headers(token),
-            json=body,
+            url, headers=_api_headers(token), json=body,
             timeout=DEFAULT_TIMEOUT_SECONDS,
         )
     except requests.RequestException as e:
@@ -198,6 +171,29 @@ def _write_last_id(
             f"GitHub PUT {url} → HTTP {put_response.status_code}: "
             f"{put_response.text[:400]}"
         )
+
+
+def _read_last_id(remote_filename: str, local_path: Path) -> Optional[int]:
+    raw = _read_raw_state(remote_filename, local_path)
+    if raw is None:
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return None
+
+
+def _write_last_id(
+    value: int,
+    remote_filename: str,
+    local_path: Path,
+    commit_prefix: str,
+) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    _write_raw_state(
+        f"{value}\n", remote_filename, local_path,
+        f"{commit_prefix}={value} @ {ts}",
+    )
 
 
 # --- New Chase de-dup --------------------------------------------------- #
@@ -217,18 +213,28 @@ def write_last_card_id(card_product_id: int) -> None:
     )
 
 
-# --- Just Pulled de-dup ------------------------------------------------- #
+# --- Just Pulled backlog ------------------------------------------------ #
 
-def read_last_hit_id() -> Optional[int]:
-    """Fetch the previously-posted hit's product_purchases.id, or None."""
-    return _read_last_id(HIT_STATE_FILENAME, HIT_LOCAL_FALLBACK_PATH)
+def read_hit_backlog() -> Optional[dict]:
+    """Return the parsed hit-backlog dict, or None if it doesn't exist
+    yet (first run) or is corrupt. Raises StateBranchError on network
+    failure (caller should fail closed)."""
+    raw = _read_raw_state(HIT_BACKLOG_FILENAME, HIT_BACKLOG_LOCAL_PATH)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        log.warning("hit_backlog.json is corrupt (%s); treating as empty", e)
+        return None
 
 
-def write_last_hit_id(hit_id: int) -> None:
-    """Record the product_purchases.id of the hit we just posted."""
-    _write_last_id(
-        hit_id,
-        HIT_STATE_FILENAME,
-        HIT_LOCAL_FALLBACK_PATH,
-        "just_pulled: hit_id",
+def write_hit_backlog(backlog: dict) -> None:
+    """Persist the hit-backlog dict to the state branch."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    n = len(backlog.get("queue", []))
+    text = json.dumps(backlog, indent=2, ensure_ascii=False) + "\n"
+    _write_raw_state(
+        text, HIT_BACKLOG_FILENAME, HIT_BACKLOG_LOCAL_PATH,
+        f"just_pulled: backlog ({n} queued) @ {ts}",
     )
