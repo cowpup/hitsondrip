@@ -110,7 +110,13 @@ def expire(
 ) -> tuple[int, int]:
     """Drop queue items pulled more than `max_age_days` ago and prune
     recently_posted entries older than `posted_retention_days`.
-    Returns (queue_dropped, posted_pruned)."""
+    Returns (queue_dropped, posted_pruned).
+
+    Note: expired queue items are NOT added to recently_posted — unlike a
+    placeholder discard. An expired hit was never rendered/posted, so it
+    needs no dedup protection; if the fetch window ever re-surfaced it,
+    re-queuing would be harmless (it'd just expire again). The two paths
+    are deliberately asymmetric."""
     queue_cutoff = now - timedelta(days=max_age_days)
     kept_queue = [
         h for h in backlog["queue"]

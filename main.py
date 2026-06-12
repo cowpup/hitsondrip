@@ -2,8 +2,10 @@
 
 Cron-fired entrypoint (12pm PT via .github/workflows/daily.yml):
 
-  1. Query DripShopLive Postgres MCP for the biggest Drip-fulfilled
-     instant-pack hit in the last 24 hours.
+  1. Query DripShopLive Postgres MCP for all $1,000+ Drip-fulfilled
+     graded hits in the last 48 hours, merge them into a FIFO backlog
+     (src/hit_backlog.py), and select the oldest usable one to post
+     (one per day; extras wait in the backlog for quiet days).
   2. Apply string transforms (pack name, card name, prices).
   3. Render an Instagram-square PNG locally with Pillow.
   4. Upload the PNG to the orphan branch `daily-output` on GitHub.
@@ -17,8 +19,9 @@ posts the error text to Slack so it surfaces in the channel within
 seconds of the cron firing, then exits non-zero so GitHub Actions
 flags the run as failed.
 
-"No hit found in 24h" is handled as a non-error outcome — the script
-posts a short "no qualifying hit today" note to Slack and exits 0.
+An empty backlog (no $1k+ hits queued or fetched) is handled as a
+non-error outcome — the script posts a short "no qualifying hit today"
+note to Slack and exits 0.
 """
 
 from __future__ import annotations
@@ -97,9 +100,9 @@ def _build_prompt() -> str:
 def fetch_top_hits() -> list[dict[str, Any]]:
     """Ask Claude to run the SQL via DripShopLive MCP and parse the JSON array.
 
-    Returns up to 5 rows ordered by value DESC. Empty list = no qualifying
-    hits in the last 24h. Raises on any other failure (auth, MCP transport,
-    JSON parse).
+    Returns all $1,000+ graded hits in the last 48h, oldest-first. Empty
+    list = no qualifying hits. Raises on any other failure (auth, MCP
+    transport, JSON parse).
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -149,9 +152,9 @@ def fetch_top_hits() -> list[dict[str, Any]]:
 def _parse_hits_json(text: str) -> list[dict[str, Any]]:
     """Pull the JSON array out of the model's fenced response.
 
-    Accepts an empty array (no hits) or up to 5 hit dicts. Defensive:
-    handles a legacy single-dict response by wrapping it in a list,
-    and handles a literal `null` as an empty list.
+    Accepts an empty array (no hits) or any number of hit dicts.
+    Defensive: handles a legacy single-dict response by wrapping it in a
+    list, and handles a literal `null` as an empty list.
     """
     fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL)
     raw = fenced.group(1) if fenced else text.strip()
