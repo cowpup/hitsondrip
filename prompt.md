@@ -4,7 +4,7 @@ You have access to the DripShopLive Postgres database via the MCP tool `dripshop
 
 ## Task
 
-Run the SQL query provided to you below verbatim against DripShopLive. The query returns up to 5 rows representing the top Drip-fulfilled instant-pack hits in the last 24 hours, ordered by value DESC.
+Run the SQL query provided to you below verbatim against DripShopLive. The query returns zero or more rows (all $1,000+ graded hits in the last 48h).
 
 ## Output format
 
@@ -14,6 +14,7 @@ Respond with exactly one fenced ```json``` block containing a JSON ARRAY of the 
 [
   {
     "hit_id": <number>,
+    "pulled_at": "2026-06-11T07:32:00Z",
     "card_name": "...",
     "card_image_url": "https://cdn.dripshop.live/product/...",
     "pack_name": "...",
@@ -25,7 +26,7 @@ Respond with exactly one fenced ```json``` block containing a JSON ARRAY of the 
 ]
 ```
 
-If the query returns zero rows (no Drip-fulfilled hits in the last 24h), respond with an empty array:
+If the query returns zero rows (no Drip-fulfilled hits in the last 48h), respond with an empty array:
 
 ```json
 []
