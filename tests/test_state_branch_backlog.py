@@ -36,8 +36,12 @@ def test_write_then_read_roundtrips():
 
 
 def test_corrupt_json_returns_none():
-    state_branch.HIT_BACKLOG_LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True)
     state_branch.HIT_BACKLOG_LOCAL_PATH.write_text("{not json", encoding="utf-8")
+    assert state_branch.read_hit_backlog() is None
+
+
+def test_non_dict_json_returns_none():
+    state_branch.HIT_BACKLOG_LOCAL_PATH.write_text("[]", encoding="utf-8")
     assert state_branch.read_hit_backlog() is None
 
 

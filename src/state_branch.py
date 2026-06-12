@@ -223,10 +223,17 @@ def read_hit_backlog() -> Optional[dict]:
     if raw is None:
         return None
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except json.JSONDecodeError as e:
         log.warning("hit_backlog.json is corrupt (%s); treating as empty", e)
         return None
+    if not isinstance(parsed, dict):
+        log.warning(
+            "hit_backlog.json is not a JSON object (got %s); treating as corrupt",
+            type(parsed).__name__,
+        )
+        return None
+    return parsed
 
 
 def write_hit_backlog(backlog: dict) -> None:
