@@ -36,7 +36,10 @@ from typing import Any, Optional
 import anthropic
 from dotenv import load_dotenv
 
-from src import image_filter, schedule_time, slack, state_branch, string_transforms
+from src import (
+    hit_backlog, image_filter, schedule_time, slack, state_branch,
+    string_transforms,
+)
 from src.image_host import publish_to_github, ImageHostError
 from src.renderer import RenderError, render_just_pulled
 from src.slack import SlackError
@@ -319,117 +322,60 @@ def build_slack_success_text(
 
 def run() -> int:
     """Returns 0 on success or empty-day, non-zero on any actual failure."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+
     try:
-        candidates = fetch_top_hits()
+        fresh_hits = fetch_top_hits()
     except Exception as e:  # noqa: BLE001 — surface raw exception to Slack
         _emit_failure_to_slack("DripShopLive query failed", e)
         return 1
 
-    if not candidates:
-        log.info("No Drip-fulfilled hits in the last 24 hours.")
-        try:
-            slack.post_message(
-                ":zzz: No Drip-fulfilled hits in the last 24 hours — "
-                "no Instagram post will be scheduled for today."
-            )
-        except SlackError as e:
-            log.error("Slack notify failed on empty-day path: %s", e)
-            return 1
-        return 0
-
-    # Iterate candidates highest-value first. Skip any whose card image
-    # matches a known placeholder hash; pick the first clean one.
-    blacklist = image_filter.load_blacklist()
-    log.info(
-        "Got %d candidate hit(s); blacklist contains %d known placeholders",
-        len(candidates), len(blacklist),
-    )
-    hit: Optional[dict[str, Any]] = None
-    skipped: list[tuple[dict[str, Any], str]] = []
-    for candidate in candidates:
-        card_url = candidate.get("card_image_url") or ""
-        if not card_url:
-            skipped.append((candidate, "no card_image_url"))
-            continue
-        blocked, reason = image_filter.is_placeholder(card_url, blacklist)
-        if blocked:
-            log.info(
-                "Skipping $%s hit on %s — %s",
-                candidate.get("hit_value"), candidate.get("card_name"), reason,
-            )
-            skipped.append((candidate, reason))
-            continue
-        hit = candidate
-        log.info("Using hit: %s (after %d skipped)", card_url, len(skipped))
-        break
-
-    if hit is None:
-        log.warning(
-            "All %d candidate hits had placeholder images; no post today.",
-            len(candidates),
-        )
-        skipped_lines = "\n".join(
-            f"  • ${c.get('hit_value')} on {c.get('card_name', '?')[:60]} — {reason}"
-            for c, reason in skipped
-        )
-        try:
-            slack.post_message(
-                f":no_entry_sign: *No usable hit today* — all "
-                f"{len(candidates)} top hits had placeholder card images.\n"
-                f"```{skipped_lines}```\n_If any of these should actually "
-                f"be postable, the renderer's filter is the issue. "
-                f"Otherwise, no action needed._"
-            )
-        except SlackError as e:
-            log.error("Slack notify failed on all-placeholder path: %s", e)
-            return 1
-        return 0
-
-    log.info(
-        "Hit: $%s on %s from %s",
-        hit.get("hit_value"), hit.get("card_name"), hit.get("pack_name"),
-    )
-
-    # --- De-dup guard ------------------------------------------------------
-    # Unlike New Chase (which skips a deduped candidate and shows the NEXT
-    # one), Just Pulled features the SINGLE biggest hit of the day. So we
-    # select the top usable hit FIRST (loop above), then compare it to the
-    # last hit we posted. If it matches, a prior run already sent an
-    # approval card for this exact hit — skip the WHOLE run rather than
-    # demote to a smaller hit. This stops a manual workflow_dispatch rerun
-    # (or an occasional double-fired schedule) from producing a second
-    # approval card → duplicate IG/X posts.
-    hit_id = hit.get("hit_id")
+    # Load the backlog (fail closed on a state read error — without it we
+    # can't safely de-dup or know what's pending; mirrors new_chase.py).
     try:
-        last_hit_id = state_branch.read_last_hit_id()
+        backlog = hit_backlog.ensure_shape(state_branch.read_hit_backlog())
     except StateBranchError as e:
-        # Fail closed: without state we can't de-dup, and posting a
-        # possible duplicate is worse than missing one run (mirrors
-        # new_chase.py's read-error handling).
         _emit_failure_to_slack("State branch read failed", e)
         return 1
-    log.info("Last posted hit_id: %r (this hit: %r)", last_hit_id, hit_id)
 
-    if (
-        hit_id is not None
-        and last_hit_id is not None
-        and int(hit_id) == int(last_hit_id)
-    ):
-        log.info(
-            "Hit id=%s already posted on a prior run; skipping to avoid a "
-            "duplicate.", hit_id,
-        )
+    added = hit_backlog.merge_new(backlog, fresh_hits)
+    dropped, pruned = hit_backlog.expire(backlog, now)
+    log.info(
+        "Backlog: %d fetched, %d new added, %d expired, %d pending after merge",
+        len(fresh_hits), added, dropped, len(backlog["queue"]),
+    )
+
+    # FIFO-select the oldest usable hit, discarding placeholder/broken ones.
+    blacklist = image_filter.load_blacklist()
+
+    def _is_placeholder(url: str) -> bool:
+        blocked, reason = image_filter.is_placeholder(url, blacklist)
+        if blocked:
+            log.info("Placeholder card image skipped: %s", reason)
+        return blocked
+
+    hit = hit_backlog.pop_next_usable(backlog, _is_placeholder, now)
+
+    if hit is None:
+        log.info("Backlog empty / no usable hit; nothing to post today.")
+        # Persist merges/expiry/placeholder discards before exiting.
+        _save_backlog_best_effort(backlog)
         try:
             slack.post_message(
-                f":repeat: *Already posted* — the biggest hit in the last 24h "
-                f"(${int(round(float(hit['hit_value'])))} on "
-                f"{hit.get('card_name', '?')}, id={hit_id}) already went out "
-                f"for approval on an earlier run. No new post created."
+                ":zzz: No qualifying hit today — the $1,000+ backlog is "
+                "empty. No Instagram post will be scheduled."
             )
         except SlackError as e:
-            log.error("Slack notify failed on already-posted path: %s", e)
+            log.error("Slack notify failed on empty-backlog path: %s", e)
             return 1
         return 0
+
+    log.info(
+        "Selected hit: $%s on %s from %s (id=%s, pulled %s)",
+        hit.get("hit_value"), hit.get("card_name"), hit.get("pack_name"),
+        hit.get("hit_id"), hit.get("pulled_at"),
+    )
 
     # Render
     try:
@@ -520,29 +466,36 @@ def run() -> int:
         return 1
 
     # --- Record state ------------------------------------------------------
-    # Written AFTER the approval card posts (not on Worker ✅) so a same-day
-    # rerun won't regenerate a card for this hit. Semantic mirrors
-    # new_chase: state = "hit already presented to Noah." If Noah ❌ Skips,
-    # we still won't re-show it. A failed run above returns non-zero and
-    # leaves state untouched so it retries. On write failure we log +
-    # Slack-warn but DON'T fail the run — the card is already out; risking
-    # a duplicate beats aborting a successful post.
-    if hit_id is not None:
+    # Mark this hit consumed and persist the backlog AFTER the approval card
+    # posted (not on Worker ✅) so a same-day rerun won't re-present it. A
+    # failed run above returns non-zero WITHOUT saving, leaving the hit
+    # queued for retry. A save failure here logs + Slack-warns but does not
+    # fail the run — the card is already out.
+    hit_backlog.mark_posted(backlog, hit, now)
+    if not _save_backlog_best_effort(backlog):
         try:
-            state_branch.write_last_hit_id(int(hit_id))
-            log.info("Wrote state: last_hit_id=%s", hit_id)
-        except StateBranchError as e:
-            log.error("State branch write FAILED (continuing): %s", e)
-            try:
-                slack.post_message(
-                    f":warning: Just Pulled post succeeded BUT state write "
-                    f"failed: `{e}`. A rerun may re-show hit id `{hit_id}` — "
-                    f"manually update `state/last_hit_id.txt` if needed."
-                )
-            except SlackError:
-                pass
+            slack.post_message(
+                f":warning: Just Pulled post succeeded BUT backlog save "
+                f"failed. A rerun may re-present hit id `{hit.get('hit_id')}` "
+                f"— check `state/hit_backlog.json`."
+            )
+        except SlackError:
+            pass
 
     return 0
+
+
+def _save_backlog_best_effort(backlog: dict) -> bool:
+    """Write the backlog to the state branch. Returns True on success,
+    False on StateBranchError (logged, not raised)."""
+    try:
+        state_branch.write_hit_backlog(backlog)
+        log.info("Saved backlog: %d queued, %d recently_posted",
+                 len(backlog["queue"]), len(backlog["recently_posted"]))
+        return True
+    except StateBranchError as e:
+        log.error("Backlog save FAILED (continuing): %s", e)
+        return False
 
 
 def _build_approval_buttons(payload: dict[str, Any]) -> list[dict[str, Any]]:
