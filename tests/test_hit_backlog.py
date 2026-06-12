@@ -89,3 +89,37 @@ class TestMergeNew:
         added = hb.merge_new(b, [_hit(5), _hit(5)])
         assert added == 1
         assert [h["hit_id"] for h in b["queue"]] == [5]
+
+
+class TestExpire:
+    def test_drops_queue_items_older_than_max_age(self):
+        b = {
+            "queue": [
+                _hit(1, pulled_at="2026-06-01T00:00:00Z"),  # 10 days old
+                _hit(2, pulled_at="2026-06-10T00:00:00Z"),  # 1 day old
+            ],
+            "recently_posted": [],
+        }
+        dropped, pruned = hb.expire(b, _now())
+        assert dropped == 1
+        assert [h["hit_id"] for h in b["queue"]] == [2]
+
+    def test_keeps_items_exactly_at_cutoff(self):
+        # 7 days old exactly — not older than 7 days, so kept.
+        b = {"queue": [_hit(1, pulled_at="2026-06-04T18:00:00Z")],
+             "recently_posted": []}
+        dropped, _ = hb.expire(b, _now())
+        assert dropped == 0
+        assert len(b["queue"]) == 1
+
+    def test_prunes_recently_posted_older_than_retention(self):
+        b = {
+            "queue": [],
+            "recently_posted": [
+                {"hit_id": 1, "at": "2026-05-20T00:00:00Z"},  # 22 days
+                {"hit_id": 2, "at": "2026-06-10T00:00:00Z"},  # 1 day
+            ],
+        }
+        _, pruned = hb.expire(b, _now())
+        assert pruned == 1
+        assert [r["hit_id"] for r in b["recently_posted"]] == [2]

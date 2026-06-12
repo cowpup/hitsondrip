@@ -99,3 +99,31 @@ def merge_new(backlog: dict, hits: list[dict]) -> int:
         known.add(hid)
         added += 1
     return added
+
+
+def expire(
+    backlog: dict,
+    now: datetime,
+    max_age_days: int = QUEUE_MAX_AGE_DAYS,
+    posted_retention_days: int = POSTED_RETENTION_DAYS,
+) -> tuple[int, int]:
+    """Drop queue items pulled more than `max_age_days` ago and prune
+    recently_posted entries older than `posted_retention_days`.
+    Returns (queue_dropped, posted_pruned)."""
+    queue_cutoff = now - timedelta(days=max_age_days)
+    kept_queue = [
+        h for h in backlog["queue"]
+        if parse_pulled_at(h.get("pulled_at"), now) >= queue_cutoff
+    ]
+    dropped = len(backlog["queue"]) - len(kept_queue)
+    backlog["queue"] = kept_queue
+
+    posted_cutoff = now - timedelta(days=posted_retention_days)
+    kept_posted = [
+        r for r in backlog["recently_posted"]
+        if parse_pulled_at(r.get("at"), now) >= posted_cutoff
+    ]
+    pruned = len(backlog["recently_posted"]) - len(kept_posted)
+    backlog["recently_posted"] = kept_posted
+
+    return dropped, pruned
