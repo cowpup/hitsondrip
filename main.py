@@ -30,6 +30,7 @@ import os
 import re
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -322,7 +323,6 @@ def build_slack_success_text(
 
 def run() -> int:
     """Returns 0 on success or empty-day, non-zero on any actual failure."""
-    from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
 
     try:
@@ -342,8 +342,8 @@ def run() -> int:
     added = hit_backlog.merge_new(backlog, fresh_hits)
     dropped, pruned = hit_backlog.expire(backlog, now)
     log.info(
-        "Backlog: %d fetched, %d new added, %d expired, %d pending after merge",
-        len(fresh_hits), added, dropped, len(backlog["queue"]),
+        "Backlog: %d fetched, %d new added, %d expired, %d posted-pruned, %d pending after merge",
+        len(fresh_hits), added, dropped, pruned, len(backlog["queue"]),
     )
 
     # FIFO-select the oldest usable hit, discarding placeholder/broken ones.
@@ -359,8 +359,6 @@ def run() -> int:
 
     if hit is None:
         log.info("Backlog empty / no usable hit; nothing to post today.")
-        # Persist merges/expiry/placeholder discards before exiting.
-        _save_backlog_best_effort(backlog)
         try:
             slack.post_message(
                 ":zzz: No qualifying hit today — the $1,000+ backlog is "
@@ -369,6 +367,8 @@ def run() -> int:
         except SlackError as e:
             log.error("Slack notify failed on empty-backlog path: %s", e)
             return 1
+        # Save after a successful notify (mirrors the success-path ordering).
+        _save_backlog_best_effort(backlog)
         return 0
 
     log.info(
@@ -426,10 +426,8 @@ def run() -> int:
     # that scheduled drafts up front, and also removes the need for a
     # fail-closed cleanup cron — no Metricool state exists to clean up.
     publish_iso, publish_tz = schedule_time.next_6pm_pt()
-    from datetime import datetime as _dt
-    from datetime import timedelta as _td
-    publish_dt = _dt.fromisoformat(publish_iso)
-    x_publish_dt = publish_dt + _td(minutes=15)
+    publish_dt = datetime.fromisoformat(publish_iso)
+    x_publish_dt = publish_dt + timedelta(minutes=15)
     x_publish_iso = x_publish_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
     ig_caption = build_caption(hit)
