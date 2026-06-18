@@ -1,5 +1,16 @@
 {
-  "queue": [],
+  "queue": [
+    {
+      "hit_id": 4122238,
+      "pulled_at": "2026-06-18T17:47:26.705000Z",
+      "card_name": "PSA MINT 9 LUGIA-HOLO, 2000, POKEMON JAPANESE NEO, #249",
+      "card_image_url": "https://cdn.dripshop.live/product/Y5e6x2qjShJ-K4LlPtyT7.webp",
+      "pack_name": "The Shining Slab Pack",
+      "pack_price": 250.0,
+      "pack_image_url": "https://cdn.dripshop.live/product/whvRMlPPcamm-YTSk_wlh.png",
+      "hit_value": 1000.0
+    }
+  ],
   "recently_posted": [
     {
       "hit_id": 4092287,
@@ -12,6 +23,10 @@
     {
       "hit_id": 4112372,
       "at": "2026-06-17T21:06:39.657727+00:00"
+    },
+    {
+      "hit_id": 4121255,
+      "at": "2026-06-18T21:22:28.527649+00:00"
     }
   ]
 }
