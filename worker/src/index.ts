@@ -450,7 +450,9 @@ async function createInstagramPost(
   env: Env,
 ): Promise<string | null> {
   const body = {
-    text: caption,
+    // IG stories carry no caption; a non-empty text fails at publish.
+    // The caption param is kept for signature stability (see index.ts:225).
+    text: "",
     media: [imageUrl],
     mediaAltText: [],
     providers: [{ network: "instagram" }],
