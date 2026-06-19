@@ -35,6 +35,7 @@ Failures (renderer / upload / Slack) post error text to Slack and exit 1.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import os
@@ -48,12 +49,14 @@ from typing import Any, Optional
 
 import anthropic
 from dotenv import load_dotenv
+from PIL import Image
 
 from src import schedule_time, slack, state_branch, string_transforms
 from src.image_host import publish_to_github, ImageHostError
 from src.new_chase_renderer import RenderError, render_new_chase
 from src.slack import SlackError
 from src.state_branch import StateBranchError
+from src.story_canvas import wrap_9x16
 
 # --------------------------------------------------------------------------- #
 # Config + logging
@@ -358,7 +361,12 @@ def render_post_to_bytes(
             hit_value=int(round(hit_value)),
             output_path=out_path,
         )
-        return out_path.read_bytes()
+        rendered = Image.open(out_path)
+        rendered.load()
+    story = wrap_9x16(rendered)
+    buf = io.BytesIO()
+    story.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 # --------------------------------------------------------------------------- #
