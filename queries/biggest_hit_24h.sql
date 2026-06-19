@@ -55,6 +55,5 @@ WHERE pp.created_at >= NOW() - INTERVAL '48 hours'
   AND card.cert_number IS NOT NULL
   AND card.image NOT LIKE '%video-renders%'
   AND pgp.value IS NOT NULL
-  AND pgp.value >= 250  -- TEMP TEST 2026-06-19: lowered from 1000 to force one card; REVERT to 1000
-ORDER BY pp.created_at DESC  -- TEMP TEST: freshest first (REVERT to ASC)
-LIMIT 1;  -- TEMP TEST: only one hit so the backlog isn't polluted (REVERT: remove this line)
+  AND pgp.value >= 1000
+ORDER BY pp.created_at ASC;  -- oldest first; Python backlog does FIFO selection
