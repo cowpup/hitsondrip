@@ -44,10 +44,12 @@ from src import (
     hit_backlog, image_filter, schedule_time, slack, state_branch,
     string_transforms,
 )
+from PIL import Image
 from src.image_host import publish_to_github, ImageHostError
 from src.renderer import RenderError, render_just_pulled
 from src.slack import SlackError
 from src.state_branch import StateBranchError
+from src.story_canvas import wrap_9x16
 
 # --------------------------------------------------------------------------- #
 # Config + logging
@@ -205,7 +207,12 @@ def render_post_to_bytes(
             hit_value=hit_value,
             output_path=out_path,
         )
-        return out_path.read_bytes()
+        rendered = Image.open(out_path)
+        rendered.load()
+    story = wrap_9x16(rendered)
+    buf = io.BytesIO()
+    story.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 # --------------------------------------------------------------------------- #
