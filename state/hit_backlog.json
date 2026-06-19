@@ -1,16 +1,5 @@
 {
-  "queue": [
-    {
-      "hit_id": 4124574,
-      "pulled_at": "2026-06-19T02:18:52.541000Z",
-      "card_name": "PSA GEM MT 10 CHARIZARD ex, 2023, POKEMON MEW EN-151, #199",
-      "card_image_url": "https://cdn.dripshop.live/product/ack-KusEwzix0MWiA3flC.webp",
-      "pack_name": "Team Up Titans",
-      "pack_image_url": "https://cdn.dripshop.live/product/KQvFTeoS_dqO41z-HUB2q.png",
-      "pack_price": 250.0,
-      "hit_value": 1599.99
-    }
-  ],
+  "queue": [],
   "recently_posted": [
     {
       "hit_id": 4092287,
@@ -31,6 +20,10 @@
     {
       "hit_id": 4122238,
       "at": "2026-06-19T18:40:44.024132+00:00"
+    },
+    {
+      "hit_id": 4124574,
+      "at": "2026-06-19T20:25:59.293047+00:00"
     }
   ]
 }
