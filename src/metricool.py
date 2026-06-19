@@ -1,4 +1,4 @@
-"""Metricool REST API wrapper — brand lookup + Instagram feed-post scheduling.
+"""Metricool REST API wrapper — brand lookup + Instagram story scheduling.
 
 Confirmed against the official mcp-metricool v1.1.9 source:
 - Base URL: https://app.metricool.com/api (no trailing slash)
@@ -237,7 +237,11 @@ def schedule_instagram_post(
     draft: bool = False,
     auto_publish: bool = True,
 ) -> dict[str, Any]:
-    """Schedule a single Instagram feed post.
+    """Schedule a single Instagram story.
+
+    Posts as an ephemeral story (instagramData.type="STORY"), not a feed
+    grid post. Stories expire after 24h and are full-screen 9:16; the
+    existing graphics are published as-is (Metricool/IG will fit them).
 
     Args:
         blog_id: Metricool blog ID (from find_instagram_brand()["blog_id"]).
@@ -281,7 +285,7 @@ def schedule_instagram_post(
         "shortener": False,
         "smartLinkData": {"ids": []},
         "descendants": [],
-        "instagramData": {"type": "POST"},  # POST = feed; not REEL or STORY
+        "instagramData": {"type": "STORY"},  # STORY = ephemeral story; not POST (feed) or REEL
     }
 
     return _request(

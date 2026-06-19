@@ -462,7 +462,7 @@ async function createInstagramPost(
     shortener: false,
     smartLinkData: { ids: [] },
     descendants: [],
-    instagramData: { type: "POST" },
+    instagramData: { type: "STORY" },
   };
   return await metricoolPost(body, env);
 }
