@@ -59,6 +59,15 @@ Both `main.py` and `new_chase.py` expose a `render_post_to_bytes(...)` that runs
 
 This keeps the wrapping concern out of the renderers themselves (which continue to emit 4:5) and out of the upload/Slack/Metricool layers (which are format-agnostic). It is the single funnel both automations already pass through.
 
+## Caption removal for IG stories
+
+Instagram stories do not support a feed-style caption; a non-empty `text` on a STORY-type post fails to publish. The Worker's `createInstagramPost` (`worker/src/index.ts`) currently sets `text: post.ig.caption`. Change it to send an empty `text` for the story.
+
+- Verified 2026-06-19: a STORY draft with `text: ""` is accepted by Metricool (returns `text: ''`).
+- **X is unaffected:** `createXPost` uses its own `post.x.caption`; only the Instagram body is blanked.
+- **No upstream change:** `main.py` / `new_chase.py` keep generating the IG caption, and the approval-payload parser keeps requiring `ig.caption` (so the existing Slack approval flow and validation are untouched). The caption is simply not forwarded as the story's `text`. This keeps the change to the single Worker line and avoids rippling into captions, validation, and Slack.
+- Implementation: in `createInstagramPost`, set `text: ""` (with a comment that IG stories carry no caption). The `caption` parameter is retained for signature stability and to keep the call site at `index.ts:225` unchanged.
+
 ## Data flow
 
 ```
@@ -87,6 +96,6 @@ No network, fast, deterministic.
 
 ## Scope
 
-In: `src/story_canvas.py`, wrap-step insertion in `main.py` and `new_chase.py`, unit tests.
+In: `src/story_canvas.py`, wrap-step insertion in `main.py` and `new_chase.py`, the `text: ""` change in `worker/src/index.ts createInstagramPost` (requires a Worker redeploy), unit tests.
 
 Out (YAGNI): new Canva artwork, any `*_BBOX_DU` changes, a darken/dim overlay knob on the blurred background (the black edges already give separation; add later only if output looks flat), per-automation resolution overrides.
