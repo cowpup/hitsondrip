@@ -1,14 +1,14 @@
 {
   "queue": [
     {
-      "hit_id": 4122238,
-      "pulled_at": "2026-06-18T17:47:26.705000Z",
-      "card_name": "PSA MINT 9 LUGIA-HOLO, 2000, POKEMON JAPANESE NEO, #249",
-      "card_image_url": "https://cdn.dripshop.live/product/Y5e6x2qjShJ-K4LlPtyT7.webp",
-      "pack_name": "The Shining Slab Pack",
+      "hit_id": 4124574,
+      "pulled_at": "2026-06-19T02:18:52.541000Z",
+      "card_name": "PSA GEM MT 10 CHARIZARD ex, 2023, POKEMON MEW EN-151, #199",
+      "card_image_url": "https://cdn.dripshop.live/product/ack-KusEwzix0MWiA3flC.webp",
+      "pack_name": "Team Up Titans",
+      "pack_image_url": "https://cdn.dripshop.live/product/KQvFTeoS_dqO41z-HUB2q.png",
       "pack_price": 250.0,
-      "pack_image_url": "https://cdn.dripshop.live/product/whvRMlPPcamm-YTSk_wlh.png",
-      "hit_value": 1000.0
+      "hit_value": 1599.99
     }
   ],
   "recently_posted": [
@@ -27,6 +27,10 @@
     {
       "hit_id": 4121255,
       "at": "2026-06-18T21:22:28.527649+00:00"
+    },
+    {
+      "hit_id": 4122238,
+      "at": "2026-06-19T18:40:44.024132+00:00"
     }
   ]
 }
