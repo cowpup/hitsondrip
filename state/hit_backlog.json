@@ -1,5 +1,16 @@
 {
-  "queue": [],
+  "queue": [
+    {
+      "hit_id": 4169894,
+      "pulled_at": "2026-06-25T05:19:42.451000Z",
+      "card_name": "PSA GEM MT 10 CUBONE, 2025, POKEMON SIMPLIFIED CHINESE CBB3 C-GEM PACK VOL 3, #7",
+      "card_image_url": "https://cdn.dripshop.live/product/KLRZhakVDbYah1hq5Bkhs.webp",
+      "pack_name": "Team Up Titans",
+      "pack_price": 250.0,
+      "pack_image_url": "https://cdn.dripshop.live/product/KQvFTeoS_dqO41z-HUB2q.png",
+      "hit_value": 1063.46
+    }
+  ],
   "recently_posted": [
     {
       "hit_id": 4092287,
@@ -36,6 +47,10 @@
     {
       "hit_id": 4148848,
       "at": "2026-06-22T21:31:32.619911+00:00"
+    },
+    {
+      "hit_id": 4169147,
+      "at": "2026-06-25T20:57:18.260702+00:00"
     }
   ]
 }
